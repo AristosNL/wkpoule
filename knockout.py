@@ -117,12 +117,21 @@ def resolve_and_play(winners, runners, thirds_by_group, qualifying_third_groups,
 
     reached = {s: set() for s in ["last32", "last16", "quarter", "semi", "final"]}
     reached["winner"] = None
+    bracket = []   # [{round: 'R32', matches: [(home, away, winner), ...]}, ...]
     for h, a in current:
         reached["last32"].update([h, a])
 
+    round_names = ["R32", "R16", "QF", "SF", "F"]
     si = 0
     while current:
-        round_winners = [simulate_match(h, a, knockout=True)[0] for h, a in current]
+        match_results = []
+        round_winners = []
+        for h, a in current:
+            w, gh, ga = simulate_match(h, a, knockout=True)
+            match_results.append((h, a, w))
+            round_winners.append(w)
+        bracket.append({"round": round_names[si] if si < len(round_names) else "?",
+                        "matches": match_results})
         stage = STAGE_AFTER[si]
         if stage == "winner":
             reached["winner"] = round_winners[0]
@@ -131,6 +140,7 @@ def resolve_and_play(winners, runners, thirds_by_group, qualifying_third_groups,
         current = [(round_winners[i], round_winners[i + 1])
                    for i in range(0, len(round_winners), 2)]
         si += 1
+    reached["bracket"] = bracket
     return reached
 
 

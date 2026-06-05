@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from data_loader import (load_international_results, split_played_and_fixtures,
                          load_wc2026_fixtures)
@@ -113,6 +114,81 @@ def expected_points_heatmap(matrix, rules, home, away, n=6):
         margin=dict(l=10, r=10, t=30, b=10),
     )
     return fig
+
+
+def render_bracket_html(bracket_data: list) -> str:
+    """Bouw een HTML-bracket uit de modale teams per slot. 5 kolommen + winnaar."""
+    short = {
+        "Bosnia and Herzegovina": "Bosnia & H.", "Czech Republic": "Czech R.",
+        "South Korea": "S. Korea", "United States": "USA", "DR Congo": "DR Congo",
+        "Saudi Arabia": "Saudi A.", "Ivory Coast": "Ivory C.", "New Zealand": "N. Zealand",
+        "Cape Verde": "Cape V.",
+    }
+    sh = lambda t: short.get(t, t)
+    titles = {"R32": "Laatste 32", "R16": "Achtste finale", "QF": "Kwartfinale",
+              "SF": "Halve finale", "F": "Finale"}
+
+    def cell(name, prob, is_winner):
+        # gedempt tonen als de positie onzeker is (<25%)
+        muted = "" if prob >= 0.25 else "opacity:0.65;font-style:italic;"
+        cls = "team winner" if is_winner else "team"
+        return (f'<div class="{cls}" style="{muted}">'
+                f'<span class="n">{sh(name)}</span>'
+                f'<span class="p">{prob*100:.0f}%</span></div>')
+
+    cols_html = []
+    champion = None
+    for r in bracket_data:
+        rn = r["round"]
+        items = [f'<div class="round-title">{titles.get(rn, rn)}</div>']
+        for m in r["matches"]:
+            w = m["winner"]
+            home_winner = (m["home"] == w)
+            away_winner = (m["away"] == w)
+            items.append(
+                '<div class="match">'
+                + cell(m["home"], m["p_home"], home_winner)
+                + cell(m["away"], m["p_away"], away_winner)
+                + '</div>')
+        cols_html.append('<div class="round">' + "".join(items) + '</div>')
+        if rn == "F" and r["matches"]:
+            champion = r["matches"][0]
+
+    # extra kolom voor de wereldkampioen
+    if champion:
+        w_html = (
+            '<div class="round">'
+            '<div class="round-title">Wereldkampioen</div>'
+            '<div class="champion-wrap">'
+            f'<div class="champion-box">🏆<br>{sh(champion["winner"])}'
+            f'<div class="champion-prob">{champion["p_winner"]*100:.0f}%</div></div></div></div>'
+        )
+        cols_html.append(w_html)
+
+    css = """
+    <style>
+      body { font-family: -apple-system, system-ui, sans-serif; margin: 0; }
+      .bracket { display: flex; gap: 6px; padding: 6px; min-height: 1100px; font-size: 11px; }
+      .round { flex: 1; display: flex; flex-direction: column; justify-content: space-around; min-width: 0; }
+      .round-title { background: #185FA5; color: white; padding: 5px 6px; text-align: center;
+                     font-weight: 600; border-radius: 4px; margin-bottom: 4px; font-size: 11px;
+                     letter-spacing: 0.02em; }
+      .match { background: #F8F8F6; border: 1px solid #E0E0D8; border-radius: 4px;
+               padding: 3px 4px; margin: 2px 0; }
+      .team { display: flex; justify-content: space-between; align-items: center;
+              padding: 2px 4px; gap: 6px; }
+      .team.winner { background: #D0E5FA; font-weight: 600; border-radius: 3px; color: #042C53; }
+      .team .n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .team .p { font-size: 9px; color: #999; }
+      .team.winner .p { color: #185FA5; }
+      .champion-wrap { display: flex; flex-direction: column; justify-content: center; flex: 1; }
+      .champion-box { background: linear-gradient(135deg, #FFD466, #E89B1A); color: #3A2400;
+                      text-align: center; padding: 18px 8px; border-radius: 8px;
+                      font-weight: 700; font-size: 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); }
+      .champion-prob { font-size: 11px; font-weight: 500; margin-top: 6px; color: #5A3A00; }
+    </style>
+    """
+    return css + '<div class="bracket">' + "".join(cols_html) + '</div>'
 
 
 # ----------------------------------------------------------------------------
@@ -405,3 +481,9 @@ with tab4:
                 st.dataframe(pd.DataFrame(few_rows), use_container_width=True, hide_index=True)
             st.caption("Kaarten zijn ruisig en scheidsrechter-afhankelijk — behandel dit "
                        "als ruwe indicatie, niet als sterke voorspelling.")
+
+        # 5. Knock-out bracket volgens FIFA-schema
+        st.subheader("5 · Knock-out bracket (volgens FIFA-schema, ingevuld door simulatie)")
+        st.caption("Per slot het meest voorkomende team uit de simulatie. Het percentage "
+                   "geeft aan hoe vaak dat team daar terechtkomt — lage % = onzekere positie.")
+        components.html(render_bracket_html(sim["bracket"]), height=1180, scrolling=True)

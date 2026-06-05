@@ -43,6 +43,8 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42):
     ga_sum = defaultdict(float)                       # som goals tegen
     most_gf = defaultdict(float)                      # hoe vaak meeste goals voor
     most_ga = defaultdict(float)                      # hoe vaak meeste goals tegen
+    # bracket-tracking: per (ronde, match_idx, side) -> {team: count}
+    bracket_pos = defaultdict(lambda: defaultdict(int))
 
     def sim_match(home, away, knockout=False, city=None):
         return _simulate_match(rng, ratings, cal, home, away, knockout=knockout, city=city)
@@ -90,6 +92,14 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42):
         if reached["winner"] is not None:
             reach[reached["winner"]]["winner"] += 1
 
+        # bracket per ronde aggregeren: home/away per match + de winnaar
+        for round_data in reached.get("bracket", []):
+            rn = round_data["round"]
+            for mi, (h, a, w) in enumerate(round_data["matches"]):
+                bracket_pos[(rn, mi, "home")][h] += 1
+                bracket_pos[(rn, mi, "away")][a] += 1
+                bracket_pos[(rn, mi, "winner")][w] += 1
+
     # aggregeren
     stage_probs = []
     for team, d in reach.items():
@@ -106,8 +116,28 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42):
                     "p_most_ga": most_ga.get(team, 0) / n_sims}
              for team in team_group}
 
+    # modale bracket: per slot het meest voorkomende team + zijn waarschijnlijkheid
+    modal_bracket = []
+    round_order = ["R32", "R16", "QF", "SF", "F"]
+    round_sizes = {"R32": 16, "R16": 8, "QF": 4, "SF": 2, "F": 1}
+    for rn in round_order:
+        round_matches = []
+        for mi in range(round_sizes[rn]):
+            def pick(side):
+                d = bracket_pos.get((rn, mi, side), {})
+                if not d:
+                    return ("?", 0.0)
+                team, count = max(d.items(), key=lambda kv: kv[1])
+                return (team, count / n_sims)
+            home, p_h = pick("home")
+            away, p_a = pick("away")
+            winner, p_w = pick("winner")
+            round_matches.append({"home": home, "away": away, "winner": winner,
+                                  "p_home": p_h, "p_away": p_a, "p_winner": p_w})
+        modal_bracket.append({"round": rn, "matches": round_matches})
+
     return {"stage_probs": stage_probs, "position_probs": dict(position_probs),
-            "goals": goals}
+            "goals": goals, "bracket": modal_bracket}
 
 
 # ----------------------------------------------------------------------------

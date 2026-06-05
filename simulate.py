@@ -24,31 +24,55 @@ import numpy as np
 from model import expected_goals, Calibration
 
 
+# Officiële WK 2026-groepsindeling (FIFA), niet de alfabetische volgorde uit de fixtures.
+FIFA_GROUPS = {
+    "A": frozenset({"Mexico", "South Africa", "South Korea", "Czech Republic"}),
+    "B": frozenset({"Canada", "Bosnia and Herzegovina", "Qatar", "Switzerland"}),
+    "C": frozenset({"Brazil", "Morocco", "Haiti", "Scotland"}),
+    "D": frozenset({"United States", "Paraguay", "Australia", "Turkey"}),
+    "E": frozenset({"Germany", "Curaçao", "Ivory Coast", "Ecuador"}),
+    "F": frozenset({"Netherlands", "Japan", "Sweden", "Tunisia"}),
+    "G": frozenset({"Belgium", "Egypt", "Iran", "New Zealand"}),
+    "H": frozenset({"Spain", "Cape Verde", "Saudi Arabia", "Uruguay"}),
+    "I": frozenset({"France", "Senegal", "Iraq", "Norway"}),
+    "J": frozenset({"Argentina", "Algeria", "Austria", "Jordan"}),
+    "K": frozenset({"Portugal", "DR Congo", "Uzbekistan", "Colombia"}),
+    "L": frozenset({"England", "Croatia", "Ghana", "Panama"}),
+}
+
+
 def derive_groups(wc_fixtures) -> tuple[dict[str, list[str]], dict[str, list[tuple[str, str, str]]]]:
     """
-    Leid de 12 groepen + bijbehorende fixtures af uit de wedstrijdlijst.
-
-    Returns:
-      groups   : dict label -> lijst van 4 teamnamen
-      matches  : dict label -> lijst van (home, away, city) tuples voor die groep
+    Bepaal de 12 groepen + bijbehorende fixtures met de OFFICIËLE FIFA-labels.
+    De fixture-volgorde bepaalt niet meer welke groep welke letter krijgt.
     """
     adj = defaultdict(set)
     for r in wc_fixtures.itertuples():
         adj[r.home_team].add(r.away_team)
         adj[r.away_team].add(r.home_team)
 
-    seen, groups, gid = set(), {}, 0
+    # bepaal de feitelijke groepen (4 teams die elkaar treffen)
+    seen, raw_groups = set(), []
     for team in adj:
         if team in seen:
             continue
-        members = sorted({team} | adj[team])
+        members = frozenset({team} | adj[team])
         if len(members) == 4:
-            label = chr(ord("A") + gid)
-            groups[label] = members
+            raw_groups.append(members)
             seen.update(members)
-            gid += 1
 
-    # voeg per groep de werkelijke wedstrijden (met city) toe
+    # match elke gevonden groep tegen de officiële FIFA-indeling
+    groups: dict[str, list[str]] = {}
+    for label, official in FIFA_GROUPS.items():
+        for rg in raw_groups:
+            if rg == official:
+                groups[label] = sorted(rg)
+                break
+        else:
+            # zou niet mogen gebeuren als de fixtures kloppen
+            print(f"  ! waarschuwing: officiële groep {label} niet gevonden in fixtures")
+
+    # fixtures per groep met de officiële labels
     team_to_group = {t: g for g, members in groups.items() for t in members}
     matches: dict[str, list[tuple[str, str, str]]] = {g: [] for g in groups}
     for r in wc_fixtures.itertuples():
@@ -99,71 +123,54 @@ def _group_table(rng, ratings, cal, teams, fixtures):
     return [{"team": t, "pts": pts[t], "gd": gf[t] - ga[t], "gf": gf[t]} for t in ranked]
 
 
-def _seed_positions(n: int) -> list[int]:
-    """
-    Standaard bracket-volgorde (1-indexed seeds) voor een veld van grootte n (macht van 2).
-    Zorgt dat seed 1 en 2 elkaar pas in de finale kunnen treffen, maar legt het pad VAST.
-    Bijv. n=4 -> [1, 4, 3, 2]: posities 1-4 en 3-2 spelen, winnaars in de finale.
-    """
-    order = [1, 2]
-    while len(order) < n:
-        size = len(order) * 2
-        new = []
-        for s in order:
-            new.append(s)
-            new.append(size + 1 - s)
-        order = new
-    return order
-
-
-def build_bracket(rng, ratings, cal, qualifiers: list[str]) -> str:
-    """
-    Vaste geseede single-elimination knock-out (geen herseeding per ronde).
-    Teams worden op Elo geseed en in een standaard bracket gezet; het pad ligt
-    daarna vast, zodat sterke ploegen elkaar ook vroeg KUNNEN treffen.
-    Geeft de uiteindelijke winnaar terug.
-    """
-    seeded = sorted(qualifiers, key=lambda t: ratings.get(t, 1500), reverse=True)
-    n = 1
-    while n * 2 <= len(seeded):
-        n *= 2
-    seeded = seeded[:n]
-    # plaats teams in vaste bracketposities
-    field = [seeded[s - 1] for s in _seed_positions(n)]
-    while len(field) > 1:
-        winners = []
-        for i in range(0, len(field), 2):
-            w, _, _ = _simulate_match(rng, ratings, cal, field[i], field[i + 1], knockout=True)
-            winners.append(w)
-        field = winners  # pad ligt vast, geen herseeding
-    return field[0]
-
-
 def simulate_tournament(ratings, cal, groups, matches, n_sims=20000, seed=42):
-    """Draai het hele toernooi n_sims keer en tel fase-bereik per team."""
+    """
+    Draai het hele toernooi n_sims keer met het OFFICIËLE WK 2026-schema en tel
+    per team hoe vaak het elke fase haalt.
+
+    De knock-out volgt het echte R32-schema (zie knockout.py): groepswinnaars
+    tegen nummers 3, runners-up tegen elkaar, geen groepsgenoten in de R32.
+    """
+    from knockout import resolve_and_play
+
     rng = np.random.default_rng(seed)
-    reach = defaultdict(lambda: {"last32": 0, "winner": 0})
+    stages = ["last32", "last16", "quarter", "semi", "final", "winner"]
+    reach = defaultdict(lambda: {s: 0 for s in stages})
+
+    def sim_match(home, away, knockout=False, city=None):
+        return _simulate_match(rng, ratings, cal, home, away, knockout=knockout, city=city)
 
     for _ in range(n_sims):
-        thirds = []
-        qualifiers = []
+        winners, runners, thirds_by_group = {}, {}, {}
+        third_rows = []
         for label, teams in groups.items():
             table = _group_table(rng, ratings, cal, teams, matches[label])
-            qualifiers += [table[0]["team"], table[1]["team"]]   # top 2 plaatsen zich
-            thirds.append((table[2]["pts"], table[2]["gd"], table[2]["gf"], table[2]["team"]))
-        # 8 beste nummers 3
-        thirds.sort(reverse=True)
-        qualifiers += [t[3] for t in thirds[:8]]
-        for t in qualifiers:
-            reach[t]["last32"] += 1
-        champion = build_bracket(rng, ratings, cal, qualifiers)
-        reach[champion]["winner"] += 1
+            winners[label] = table[0]["team"]
+            runners[label] = table[1]["team"]
+            thirds_by_group[label] = table[2]["team"]
+            third_rows.append((table[2]["pts"], table[2]["gd"], table[2]["gf"], label))
+
+        # 8 beste nummers 3 (op punten, doelsaldo, goals)
+        third_rows.sort(reverse=True)
+        qualifying_third_groups = [r[3] for r in third_rows[:8]]
+
+        reached = resolve_and_play(winners, runners, thirds_by_group,
+                                   qualifying_third_groups, sim_match)
+        for s in ["last32", "last16", "quarter", "semi", "final"]:
+            for t in reached[s]:
+                reach[t][s] += 1
+        if reached["winner"] is not None:
+            reach[reached["winner"]]["winner"] += 1
 
     out = []
     for team, d in reach.items():
         out.append({
             "team": team,
             "P_last32": round(d["last32"] / n_sims, 3),
+            "P_last16": round(d["last16"] / n_sims, 3),
+            "P_quarter": round(d["quarter"] / n_sims, 3),
+            "P_semi": round(d["semi"] / n_sims, 3),
+            "P_final": round(d["final"] / n_sims, 3),
             "P_winner": round(d["winner"] / n_sims, 3),
         })
     return sorted(out, key=lambda x: -x["P_winner"])
