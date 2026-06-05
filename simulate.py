@@ -94,27 +94,79 @@ def _adjusted_rating(team: str, base_rating: float, city: str | None) -> float:
     return base_rating + altitude_adjustment(team, city)
 
 
-def _simulate_match(rng, ratings, cal, home, away, knockout=False, city: str | None = None):
-    """Simuleer 1 wedstrijd. Bij knock-out: geen gelijkspel (verlenging/penalty's)."""
-    rh = _adjusted_rating(home, ratings.get(home, 1500), city)
-    ra = _adjusted_rating(away, ratings.get(away, 1500), city)
-    lam_h, lam_a = expected_goals(rh, ra, cal, neutral=True)
-    gh, ga = _sample_score(rng, lam_h, lam_a)
-    if knockout and gh == ga:
-        # verlenging + penalty's: muntworp gewogen naar relatieve sterkte
-        ph = lam_h / (lam_h + lam_a)
-        return (home, gh, ga) if rng.random() < ph else (away, gh, ga)
+def precompute_fixture_distributions(ratings, cal, group_matches,
+                                     odds_db=None, weight_odds=0.0):
+    """
+    Bouw per groepswedstrijd een sampling-distributie. Als odds + gewicht
+    gegeven zijn, wordt de uitkomstmatrix herschaald naar de geblende 1X2.
+    Returns: {(home, away, city): (flat_pmf, n_cols)}.
+    """
+    from model import score_matrix, outcome_probs, rescale_matrix_to_outcome
+    from odds_fetcher import get_odds_probs, blend
+
+    dists = {}
+    for label, fixtures in group_matches.items():
+        for h, a, city in fixtures:
+            rh = _adjusted_rating(h, ratings.get(h, 1500), city)
+            ra = _adjusted_rating(a, ratings.get(a, 1500), city)
+            lam_h, lam_a = expected_goals(rh, ra, cal, neutral=True)
+            m = score_matrix(lam_h, lam_a, cal)
+            if odds_db and weight_odds > 0:
+                op = get_odds_probs(odds_db, h, a)
+                if op is not None:
+                    model_probs = outcome_probs(m)
+                    target = blend(model_probs, op, weight_odds)
+                    m = rescale_matrix_to_outcome(m, *target)
+            n = m.shape[1]
+            flat = m.flatten()
+            flat = flat / flat.sum()    # normalize to be safe
+            dists[(h, a, city)] = (flat, n)
+    return dists
+
+
+def _sample_from_dist(rng, pmf_data):
+    flat, n = pmf_data
+    idx = rng.choice(len(flat), p=flat)
+    return divmod(int(idx), n)
+
+
+def _simulate_match(rng, ratings, cal, home, away, knockout=False,
+                    city: str | None = None, fixture_dist=None):
+    """
+    Simuleer 1 wedstrijd. Met fixture_dist sample je uit de (mogelijk geblende)
+    precomputed matrix; zonder val je terug op de pure Poisson uit het model.
+    Bij knock-out: geen gelijkspel (verlenging/penalty's).
+    """
+    if fixture_dist is not None:
+        gh, ga = _sample_from_dist(rng, fixture_dist)
+        # voor de muntworp bij knock-out hebben we toch de lambdas nodig — fallback
+        if knockout and gh == ga:
+            rh = _adjusted_rating(home, ratings.get(home, 1500), city)
+            ra = _adjusted_rating(away, ratings.get(away, 1500), city)
+            lam_h, lam_a = expected_goals(rh, ra, cal, neutral=True)
+            ph = lam_h / (lam_h + lam_a)
+            return (home, gh, ga) if rng.random() < ph else (away, gh, ga)
+    else:
+        rh = _adjusted_rating(home, ratings.get(home, 1500), city)
+        ra = _adjusted_rating(away, ratings.get(away, 1500), city)
+        lam_h, lam_a = expected_goals(rh, ra, cal, neutral=True)
+        gh, ga = _sample_score(rng, lam_h, lam_a)
+        if knockout and gh == ga:
+            ph = lam_h / (lam_h + lam_a)
+            return (home, gh, ga) if rng.random() < ph else (away, gh, ga)
     winner = home if gh > ga else (away if ga > gh else None)
     return (winner, gh, ga)
 
 
-def _group_table(rng, ratings, cal, teams, fixtures):
-    """Speel een hele groep met de ECHTE fixtures (incl. city voor hoogte)."""
+def _group_table(rng, ratings, cal, teams, fixtures, fixture_dists=None):
+    """Speel een hele groep met de ECHTE fixtures. Met fixture_dists worden
+       geblende sampling-distributies gebruikt (anders pure Poisson)."""
     pts = {t: 0 for t in teams}
     gf = {t: 0 for t in teams}
     ga = {t: 0 for t in teams}
     for h, a, city in fixtures:
-        _, gh, ag = _simulate_match(rng, ratings, cal, h, a, city=city)
+        fd = fixture_dists.get((h, a, city)) if fixture_dists else None
+        _, gh, ag = _simulate_match(rng, ratings, cal, h, a, city=city, fixture_dist=fd)
         gf[h] += gh; ga[h] += ag; gf[a] += ag; ga[a] += gh
         if gh > ag: pts[h] += 3
         elif ag > gh: pts[a] += 3
@@ -123,13 +175,15 @@ def _group_table(rng, ratings, cal, teams, fixtures):
     return [{"team": t, "pts": pts[t], "gd": gf[t] - ga[t], "gf": gf[t]} for t in ranked]
 
 
-def simulate_tournament(ratings, cal, groups, matches, n_sims=20000, seed=42):
+def simulate_tournament(ratings, cal, groups, matches, n_sims=20000, seed=42,
+                        odds_db=None, weight_odds=0.0):
     """
     Draai het hele toernooi n_sims keer met het OFFICIËLE WK 2026-schema en tel
     per team hoe vaak het elke fase haalt.
 
-    De knock-out volgt het echte R32-schema (zie knockout.py): groepswinnaars
-    tegen nummers 3, runners-up tegen elkaar, geen groepsgenoten in de R32.
+    Met odds_db + weight_odds worden de groepswedstrijden gesampled uit de
+    geblende uitkomstmatrix (knock-out blijft puur model omdat de teams daar
+    nog niet bekend zijn).
     """
     from knockout import resolve_and_play
 
@@ -137,14 +191,22 @@ def simulate_tournament(ratings, cal, groups, matches, n_sims=20000, seed=42):
     stages = ["last32", "last16", "quarter", "semi", "final", "winner"]
     reach = defaultdict(lambda: {s: 0 for s in stages})
 
+    # eenmalige precompute van de 72 groeps-distributies
+    fixture_dists = precompute_fixture_distributions(ratings, cal, matches,
+                                                     odds_db=odds_db,
+                                                     weight_odds=weight_odds)
+
     def sim_match(home, away, knockout=False, city=None):
-        return _simulate_match(rng, ratings, cal, home, away, knockout=knockout, city=city)
+        # voor knock-out hebben we geen precompute (matchups onbekend vooraf)
+        return _simulate_match(rng, ratings, cal, home, away,
+                               knockout=knockout, city=city)
 
     for _ in range(n_sims):
         winners, runners, thirds_by_group = {}, {}, {}
         third_rows = []
         for label, teams in groups.items():
-            table = _group_table(rng, ratings, cal, teams, matches[label])
+            table = _group_table(rng, ratings, cal, teams, matches[label],
+                                 fixture_dists=fixture_dists)
             winners[label] = table[0]["team"]
             runners[label] = table[1]["team"]
             thirds_by_group[label] = table[2]["team"]

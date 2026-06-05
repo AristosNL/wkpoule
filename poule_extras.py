@@ -31,8 +31,14 @@ STAGE_COUNTS = {"last32": 32, "last16": 16, "quarter": 8,
                 "semi": 4, "final": 2, "winner": 1}
 
 
-def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42):
-    """Eén simulatieloop die alle benodigde statistieken in één keer verzamelt."""
+def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
+                  odds_db=None, weight_odds=0.0):
+    """Eén simulatieloop die alle benodigde statistieken in één keer verzamelt.
+
+    Met odds_db + weight_odds worden de groepswedstrijden gesampled uit de
+    geblende uitkomstmatrix; knock-out blijft puur model.
+    """
+    from simulate import precompute_fixture_distributions
     rng = np.random.default_rng(seed)
     stages = ["last32", "last16", "quarter", "semi", "final", "winner"]
 
@@ -46,8 +52,15 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42):
     # bracket-tracking: per (ronde, match_idx, side) -> {team: count}
     bracket_pos = defaultdict(lambda: defaultdict(int))
 
+    # eenmalige precompute van de 72 groeps-distributies
+    fixture_dists = precompute_fixture_distributions(ratings, cal, matches,
+                                                     odds_db=odds_db,
+                                                     weight_odds=weight_odds)
+
     def sim_match(home, away, knockout=False, city=None):
-        return _simulate_match(rng, ratings, cal, home, away, knockout=knockout, city=city)
+        # knock-out: precompute niet beschikbaar (matchups onbekend vooraf)
+        return _simulate_match(rng, ratings, cal, home, away,
+                               knockout=knockout, city=city)
 
     for _ in range(n_sims):
         winners, runners, thirds_by_group = {}, {}, {}
@@ -55,7 +68,8 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42):
         sim_gf, sim_ga = {}, {}
 
         for label, teams in groups.items():
-            table = _group_table(rng, ratings, cal, teams, matches[label])
+            table = _group_table(rng, ratings, cal, teams, matches[label],
+                                 fixture_dists=fixture_dists)
             for pos, rowd in enumerate(table):
                 t = rowd["team"]
                 pos_count[t][pos] += 1

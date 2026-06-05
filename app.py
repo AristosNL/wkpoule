@@ -71,11 +71,24 @@ def load_everything():
     return ratings, cal, wc.to_dict("records")
 
 
-@st.cache_data(show_spinner="Toernooi simuleren (kan ~30s duren) ...")
-def cached_simulation(_ratings, _cal, wc_records, n_sims):
-    wc = pd.DataFrame(wc_records)
-    groups, matches = derive_groups(wc)
-    return simulate_full(_ratings, _cal, groups, matches, n_sims=n_sims)
+def run_simulation(ratings, cal, wc_records, n_sims, odds_db, weight_odds):
+    """Draai de simulatie met de odds en het gewicht zoals nu in de zijbalk staan.
+    Resultaat in session_state zodat het tussen reruns/tabs gedeeld wordt."""
+    wc_local = pd.DataFrame(wc_records)
+    groups, matches = derive_groups(wc_local)
+    with st.spinner(f"Simuleren ({n_sims:,} runs"
+                    + (f", odds-blend {weight_odds*100:.0f}% over {len(odds_db)} wedstrijden"
+                       if odds_db and weight_odds > 0 else ", puur model")
+                    + ") ..."):
+        sim = simulate_full(ratings, cal, groups, matches, n_sims=n_sims,
+                            odds_db=odds_db or None, weight_odds=weight_odds)
+    st.session_state["sim_result"] = sim
+    st.session_state["sim_meta"] = {
+        "n_sims": n_sims,
+        "with_odds": bool(odds_db and weight_odds > 0),
+        "n_odds": len(odds_db) if odds_db else 0,
+        "weight": weight_odds,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -352,13 +365,21 @@ with tab2:
 # ---- Tab 3: toernooi-simulatie ----
 with tab3:
     st.write("Simuleert het hele toernooi met het **officiële R32-schema** "
-             "(groepswinnaars vs nummers 3, runners-up onderling) en schat de kans "
-             "dat elk land elke fase haalt. Gebruikt Elo + hoogte (geen odds).")
+             "(groepswinnaars vs nummers 3, runners-up onderling). De "
+             "groepswedstrijden gebruiken de odds-blend uit de zijbalk; de "
+             "knock-out blijft puur model (geen odds beschikbaar voor "
+             "onbekende matchups).")
     n_sims = st.select_slider("Aantal simulaties", options=[5000, 10000, 20000, 50000],
                               value=20000)
     if st.button("▶️ Simuleer toernooi"):
-        sim = cached_simulation(ratings, cal, wc_records, n_sims)
-        df_res = pd.DataFrame(sim["stage_probs"])
+        run_simulation(ratings, cal, wc_records, n_sims, odds_db, weight_odds)
+
+    if "sim_result" in st.session_state:
+        meta = st.session_state["sim_meta"]
+        st.caption(f"{meta['n_sims']:,} simulaties · "
+                   + (f"odds-blend {meta['weight']*100:.0f}% over {meta['n_odds']} wedstrijden"
+                      if meta["with_odds"] else "puur model (geen odds gebruikt)"))
+        df_res = pd.DataFrame(st.session_state["sim_result"]["stage_probs"])
         rename = {"P_winner": "Titel", "P_final": "Finale", "P_semi": "Halve",
                   "P_quarter": "Kwart", "P_last16": "R16", "P_last32": "R32"}
         for col, label in rename.items():
@@ -379,14 +400,20 @@ with tab3:
 # ---- Tab 4: volledig poule-advies ----
 with tab4:
     st.write("Optimaal advies voor de extra rubrieken, op basis van de "
-             "Monte-Carlo-simulatie (officieel R32-schema, Elo + hoogte).")
+             "Monte-Carlo-simulatie (officieel R32-schema). De groepswedstrijden "
+             "gebruiken de odds-blend uit de zijbalk; knock-out blijft puur model.")
     n_sims4 = st.select_slider("Aantal simulaties ", options=[5000, 10000, 20000, 50000],
                                value=20000, key="nsims_advies")
     if st.button("▶️ Genereer poule-advies"):
+        run_simulation(ratings, cal, wc_records, n_sims4, odds_db, weight_odds)
         st.session_state["advice_generated"] = True
 
-    if st.session_state.get("advice_generated"):
-        sim = cached_simulation(ratings, cal, wc_records, n_sims4)
+    if st.session_state.get("advice_generated") and "sim_result" in st.session_state:
+        sim = st.session_state["sim_result"]
+        meta = st.session_state["sim_meta"]
+        st.caption(f"{meta['n_sims']:,} simulaties · "
+                   + (f"odds-blend {meta['weight']*100:.0f}% over {meta['n_odds']} wedstrijden"
+                      if meta["with_odds"] else "puur model (geen odds gebruikt)"))
 
         # 1. Groepstanden
         st.subheader("1 · Groepstanden  (2 pt exacte plek, 1 pt bij 1 plek afwijking)")
@@ -484,6 +511,13 @@ with tab4:
 
         # 5. Knock-out bracket volgens FIFA-schema
         st.subheader("5 · Knock-out bracket (volgens FIFA-schema, ingevuld door simulatie)")
-        st.caption("Per slot het meest voorkomende team uit de simulatie. Het percentage "
-                   "geeft aan hoe vaak dat team daar terechtkomt — lage % = onzekere positie.")
-        components.html(render_bracket_html(sim["bracket"]), height=1180, scrolling=True)
+        if "bracket" not in sim:
+            st.error("De bracket-data ontbreekt in het simulatieresultaat. "
+                     "Meestal komt dit doordat `poule_extras.py`, `simulate.py` of "
+                     "`knockout.py` nog de oude versie is. Controleer dat alle vier "
+                     "bestanden (app.py + die drie) in je GitHub-repo geüpdatet zijn, "
+                     "en herstart de app via 'Manage app' → ⋮ → Reboot.")
+        else:
+            st.caption("Per slot het meest voorkomende team uit de simulatie. Het percentage "
+                       "geeft aan hoe vaak dat team daar terechtkomt — lage % = onzekere positie.")
+            components.html(render_bracket_html(sim["bracket"]), height=1180, scrolling=True)
