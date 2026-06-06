@@ -54,7 +54,7 @@ def get_secret(name: str, fallback_file: str | None = None) -> str | None:
     return None
 
 
-st.set_page_config(page_title="WK 2026 Poule-voorspeller", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Tom's WK 2026 Poule-voorspeller", page_icon="⚽", layout="wide")
 
 
 # ----------------------------------------------------------------------------
