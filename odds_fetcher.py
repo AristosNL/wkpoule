@@ -172,3 +172,78 @@ def blend(model_probs: tuple[float, float, float],
         return model_probs
     return tuple(weight_odds * o + (1 - weight_odds) * m
                  for o, m in zip(odds_probs, model_probs))
+
+
+# Namen zoals de Odds API ze geeft -> onze dataset-naam
+OUTRIGHT_NAME_MAP = {
+    "United States": "United States",
+    "USA": "United States",
+    "US": "United States",
+    "Korea Republic": "South Korea",
+    "South Korea": "South Korea",
+    "Republic of Ireland": "Ireland",
+    "Czechia": "Czech Republic",
+    "Czech Republic": "Czech Republic",
+    "Ivory Coast": "Ivory Coast",
+    "Côte d'Ivoire": "Ivory Coast",
+    "Cote d'Ivoire": "Ivory Coast",
+    "DR Congo": "DR Congo",
+    "Congo DR": "DR Congo",
+    "Bosnia and Herzegovina": "Bosnia and Herzegovina",
+    "Bosnia & Herzegovina": "Bosnia and Herzegovina",
+    "Türkiye": "Turkey",
+    "Turkey": "Turkey",
+    "Cabo Verde": "Cape Verde",
+    "Cape Verde": "Cape Verde",
+    "Curacao": "Curaçao",
+    "Curaçao": "Curaçao",
+}
+
+
+def fetch_outright_odds(api_key: str, sport_key: str = "soccer_fifa_world_cup",
+                        regions: str = "eu,uk") -> dict[str, float]:
+    """
+    Haal de outright winner-markt op (titelkansen per team) via de Odds API.
+    Retourneert {dataset_teamnaam: genormaliseerde_implied_probability}.
+
+    De ruwe implied kansen (1/decimale_odds) worden genormaliseerd om de
+    bookmaker-overround te verwijderen, zodat ze optellen tot 1.0.
+    """
+    import requests
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+    params = {"apiKey": api_key, "regions": regions,
+              "markets": "outrights", "oddsFormat": "decimal"}
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # verzamel implied kansen per team over alle bookmakers
+    from collections import defaultdict
+    raw: dict[str, list[float]] = defaultdict(list)
+    for event in data:
+        for bm in event.get("bookmakers", []):
+            for market in bm.get("markets", []):
+                if market.get("key") == "outrights":
+                    for outcome in market.get("outcomes", []):
+                        name = outcome.get("name", "")
+                        price = outcome.get("price", 0)
+                        if price > 1:
+                            raw[name].append(1.0 / price)
+
+    if not raw:
+        return {}
+
+    # gemiddelde per team (over bookmakers)
+    avg = {t: sum(p) / len(p) for t, p in raw.items()}
+
+    # normaliseer: verwijder de overround
+    total = sum(avg.values())
+    normalized = {t: p / total for t, p in avg.items()}
+
+    # vertaal naar onze dataset-namen
+    result: dict[str, float] = {}
+    for api_name, prob in normalized.items():
+        mapped = OUTRIGHT_NAME_MAP.get(api_name, api_name)
+        result[mapped] = prob
+
+    return dict(sorted(result.items(), key=lambda kv: -kv[1]))

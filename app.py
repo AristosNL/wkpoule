@@ -24,7 +24,8 @@ from data_loader import (load_international_results, split_played_and_fixtures,
 from elo import compute_elo
 from model import calibrate, predict_match
 from simulate import derive_groups, simulate_tournament
-from odds_fetcher import (load_cache, cache_info, fetch_odds, save_cache)
+from odds_fetcher import (load_cache, cache_info, fetch_odds, save_cache,
+                          fetch_outright_odds)
 from poule_strategy import ScoringRules, optimal_prediction, expected_points
 from poule_extras import (simulate_full, recommend_group_standing,
                           recommend_qualifiers, recommend_goal_leaders,
@@ -54,7 +55,7 @@ def get_secret(name: str, fallback_file: str | None = None) -> str | None:
     return None
 
 
-st.set_page_config(page_title="Tom's WK 2026 Poule-voorspeller", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="WK 2026 Poule-voorspeller", page_icon="⚽", layout="wide")
 
 
 # ----------------------------------------------------------------------------
@@ -253,13 +254,33 @@ if st.sidebar.button("🔄 Ververs odds nu"):
             if odds:
                 st.session_state["odds_db"] = odds
                 try:
-                    save_cache(odds)        # lokaal handig, op cloud niet persistent
+                    save_cache(odds)
                 except Exception:
                     pass
                 st.sidebar.success(f"{len(odds)} wedstrijden opgehaald.")
             else:
                 st.sidebar.warning("Geen wedstrijden teruggekregen "
                                    "(WK-odds mogelijk nog niet gepubliceerd).")
+        except Exception as e:
+            st.sidebar.error(f"Fout bij ophalen: {e}")
+
+st.sidebar.subheader("Bookmaker-titelkansen")
+if "outright_probs" not in st.session_state:
+    st.session_state["outright_probs"] = {}
+_n_out = len(st.session_state["outright_probs"])
+st.sidebar.caption(f"{_n_out} landen met titelkansen" if _n_out
+                   else "(nog niet opgehaald)")
+if st.sidebar.button("🔄 Ververs titelkansen"):
+    if not api_key:
+        st.sidebar.error("Geen API-key beschikbaar.")
+    else:
+        try:
+            out = fetch_outright_odds(api_key)
+            if out:
+                st.session_state["outright_probs"] = out
+                st.sidebar.success(f"{len(out)} landen opgehaald.")
+            else:
+                st.sidebar.warning("Geen titelkansen gevonden.")
         except Exception as e:
             st.sidebar.error(f"Fout bij ophalen: {e}")
 
@@ -384,17 +405,46 @@ with tab3:
                   "P_quarter": "Kwart", "P_last16": "R16", "P_last32": "R32"}
         for col, label in rename.items():
             df_res[label] = (df_res[col] * 100).round(1)
+
+        # voeg bookmaker-titelkansen toe indien beschikbaar
+        out_probs = st.session_state.get("outright_probs", {})
+        has_out = bool(out_probs)
+        if has_out:
+            df_res["Bookmakers"] = df_res["team"].map(
+                lambda t: round(out_probs.get(t, 0) * 100, 1))
+
         top = df_res.head(15)
-        fig = go.Figure(go.Bar(
-            x=top["Titel"], y=top["team"], orientation="h",
-            text=top["Titel"].map(lambda v: f"{v}%"), marker_color="#185FA5",
-        ))
-        fig.update_layout(yaxis=dict(autorange="reversed"), height=500,
-                          xaxis_title="Kans op de wereldtitel (%)",
-                          margin=dict(l=10, r=10, t=20, b=10))
+        if has_out:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(name="Simulatie", x=top["Titel"], y=top["team"],
+                                 orientation="h", marker_color="#185FA5",
+                                 text=top["Titel"].map(lambda v: f"{v}%")))
+            fig.add_trace(go.Bar(name="Bookmakers", x=top["Bookmakers"], y=top["team"],
+                                 orientation="h", marker_color="#E8A020",
+                                 text=top["Bookmakers"].map(lambda v: f"{v}%")))
+            fig.update_layout(barmode="group", yaxis=dict(autorange="reversed"),
+                              height=520, xaxis_title="Kans op de wereldtitel (%)",
+                              margin=dict(l=10, r=10, t=20, b=10),
+                              legend=dict(orientation="h", y=1.05))
+        else:
+            fig = go.Figure(go.Bar(
+                x=top["Titel"], y=top["team"], orientation="h",
+                text=top["Titel"].map(lambda v: f"{v}%"), marker_color="#185FA5"))
+            fig.update_layout(yaxis=dict(autorange="reversed"), height=500,
+                              xaxis_title="Kans op de wereldtitel (%)",
+                              margin=dict(l=10, r=10, t=20, b=10))
         st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df_res[["team", "Titel", "Finale", "Halve", "Kwart", "R16", "R32"]],
-                     use_container_width=True, hide_index=True, height=560)
+
+        cols_show = ["team", "Titel"]
+        if has_out:
+            df_res["Verschil"] = (df_res["Titel"] - df_res["Bookmakers"]).round(1)
+            cols_show += ["Bookmakers", "Verschil"]
+        cols_show += ["Finale", "Halve", "Kwart", "R16", "R32"]
+        if not has_out:
+            st.caption("Haal de bookmaker-titelkansen op via '🔄 Ververs titelkansen' "
+                       "in de zijbalk voor een directe vergelijking.")
+        st.dataframe(df_res[cols_show], use_container_width=True,
+                     hide_index=True, height=560)
 
 
 # ---- Tab 4: volledig poule-advies ----
@@ -435,12 +485,30 @@ with tab4:
         quals, totaal_quals = recommend_qualifiers(sim["stage_probs"])
         labels = {"last32": "Laatste 32", "last16": "Achtste finale", "quarter": "Kwartfinale",
                   "semi": "Halve finale", "final": "Finale", "winner": "Winnaar"}
+        out_probs = st.session_state.get("outright_probs", {})
         st.caption(f"Verwacht totaal: {totaal_quals:.1f} pt")
         for stage in ["last32", "last16", "quarter", "semi", "final", "winner"]:
             info = quals[stage]
             with st.expander(f"{labels[stage]} — kies {STAGE_COUNTS[stage]}  "
                              f"({STAGE_POINTS_DEFAULT[stage]} pt p.s., verwacht {info['ev']:.1f} pt)"):
                 st.write(", ".join(info["picks"]))
+                # voor de winnaar: extra vergelijkingstabel met bookmakers
+                if stage == "winner" and out_probs:
+                    st.markdown("---")
+                    st.markdown("**Simulatie vs. bookmakers (top 10 WK-kansen)**")
+                    sp = sorted(sim["stage_probs"], key=lambda x: -x["P_winner"])[:10]
+                    cmp_rows = []
+                    for r in sp:
+                        t = r["team"]
+                        sim_p = round(r["P_winner"] * 100, 1)
+                        bk_p = round(out_probs.get(t, 0) * 100, 1)
+                        diff = round(sim_p - bk_p, 1)
+                        arrow = "↑" if diff > 1 else ("↓" if diff < -1 else "≈")
+                        cmp_rows.append({"Team": t, "Simulatie %": sim_p,
+                                         "Bookmakers %": bk_p, "Verschil": diff,
+                                         "": arrow})
+                    st.dataframe(pd.DataFrame(cmp_rows), hide_index=True,
+                                 use_container_width=True)
 
         # 3. Goaltotalen
         st.subheader("3 · Goaltotalen groepsfase (totaal over 3 wedstrijden)")
