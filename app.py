@@ -77,18 +77,23 @@ def run_simulation(ratings, cal, wc_records, n_sims, odds_db, weight_odds):
     Resultaat in session_state zodat het tussen reruns/tabs gedeeld wordt."""
     wc_local = pd.DataFrame(wc_records)
     groups, matches = derive_groups(wc_local)
+    out_probs = st.session_state.get("outright_probs") or None
+    ko_label = ("bookmaker-outrights + Elo-fallback"
+                if out_probs else "puur Elo")
     with st.spinner(f"Simuleren ({n_sims:,} runs"
-                    + (f", odds-blend {weight_odds*100:.0f}% over {len(odds_db)} wedstrijden"
-                       if odds_db and weight_odds > 0 else ", puur model")
-                    + ") ..."):
+                    + (f", groepsfase: odds-blend {weight_odds*100:.0f}%"
+                       if odds_db and weight_odds > 0 else ", groepsfase: puur model")
+                    + f", knock-out: {ko_label}) ..."):
         sim = simulate_full(ratings, cal, groups, matches, n_sims=n_sims,
-                            odds_db=odds_db or None, weight_odds=weight_odds)
+                            odds_db=odds_db or None, weight_odds=weight_odds,
+                            outright_probs=out_probs)
     st.session_state["sim_result"] = sim
     st.session_state["sim_meta"] = {
         "n_sims": n_sims,
         "with_odds": bool(odds_db and weight_odds > 0),
         "n_odds": len(odds_db) if odds_db else 0,
         "weight": weight_odds,
+        "ko_mode": ko_label,
     }
 
 
@@ -398,9 +403,11 @@ with tab3:
 
     if "sim_result" in st.session_state:
         meta = st.session_state["sim_meta"]
+        ko_info = meta.get("ko_mode", "puur Elo")
         st.caption(f"{meta['n_sims']:,} simulaties · "
-                   + (f"odds-blend {meta['weight']*100:.0f}% over {meta['n_odds']} wedstrijden"
-                      if meta["with_odds"] else "puur model (geen odds gebruikt)"))
+                   + (f"groep: odds-blend {meta['weight']*100:.0f}%"
+                      if meta["with_odds"] else "groep: puur model")
+                   + f" · knock-out: {ko_info}")
         df_res = pd.DataFrame(st.session_state["sim_result"]["stage_probs"])
         rename = {"P_winner": "Titel", "P_final": "Finale", "P_semi": "Halve",
                   "P_quarter": "Kwart", "P_last16": "R16", "P_last32": "R32"}
@@ -462,9 +469,11 @@ with tab4:
     if st.session_state.get("advice_generated") and "sim_result" in st.session_state:
         sim = st.session_state["sim_result"]
         meta = st.session_state["sim_meta"]
+        ko_info = meta.get("ko_mode", "puur Elo")
         st.caption(f"{meta['n_sims']:,} simulaties · "
-                   + (f"odds-blend {meta['weight']*100:.0f}% over {meta['n_odds']} wedstrijden"
-                      if meta["with_odds"] else "puur model (geen odds gebruikt)"))
+                   + (f"groep: odds-blend {meta['weight']*100:.0f}%"
+                      if meta["with_odds"] else "groep: puur model")
+                   + f" · knock-out: {ko_info}")
 
         # 1. Groepstanden
         st.subheader("1 · Groepstanden  (2 pt exacte plek, 1 pt bij 1 plek afwijking)")

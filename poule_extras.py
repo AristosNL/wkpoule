@@ -32,11 +32,13 @@ STAGE_COUNTS = {"last32": 32, "last16": 16, "quarter": 8,
 
 
 def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
-                  odds_db=None, weight_odds=0.0):
+                  odds_db=None, weight_odds=0.0, outright_probs=None):
     """Eén simulatieloop die alle benodigde statistieken in één keer verzamelt.
 
-    Met odds_db + weight_odds worden de groepswedstrijden gesampled uit de
-    geblende uitkomstmatrix; knock-out blijft puur model.
+    Groepsfase: geblende Poisson-matrix (odds_db + weight_odds).
+    Knock-out  : Bradley-Terry op basis van outright_probs (bookmakers) als die
+                 beschikbaar zijn; anders puur Elo. Fallback per team: als slechts
+                 één van de twee teams outright-odds heeft, wordt Elo gebruikt.
     """
     from simulate import precompute_fixture_distributions
     rng = np.random.default_rng(seed)
@@ -58,7 +60,15 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
                                                      weight_odds=weight_odds)
 
     def sim_match(home, away, knockout=False, city=None):
-        # knock-out: precompute niet beschikbaar (matchups onbekend vooraf)
+        """Match-functie: voor knock-out Bradley-Terry op outrights (Elo-fallback)."""
+        if knockout and outright_probs:
+            pa = outright_probs.get(home)
+            pb = outright_probs.get(away)
+            if pa is not None and pb is not None and (pa + pb) > 0:
+                p_home = pa / (pa + pb)
+                winner = home if rng.random() < p_home else away
+                return (winner, 0, 0)   # goals onbekend in KO-only modus
+        # fallback: puur Elo (groepswedstrijden of ontbrekende outright-odds)
         return _simulate_match(rng, ratings, cal, home, away,
                                knockout=knockout, city=city)
 
