@@ -280,9 +280,10 @@ if st.sidebar.button("🔄 Ververs titelkansen"):
                 st.session_state["outright_probs"] = out
                 st.sidebar.success(f"{len(out)} landen opgehaald.")
             else:
-                st.sidebar.warning("Geen titelkansen gevonden.")
+                st.sidebar.warning("Geen titelkansen gevonden in de response.")
         except Exception as e:
-            st.sidebar.error(f"Fout bij ophalen: {e}")
+            msg = str(e)
+            st.sidebar.error(f"Fout: {msg[:300]}")
 
 weight_odds = st.sidebar.slider("Gewicht odds vs. model", 0.0, 1.0, 0.8, 0.05,
                                 help="0.8 = 80% odds, 20% model. Geldt alleen voor "

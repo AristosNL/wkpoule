@@ -200,43 +200,73 @@ OUTRIGHT_NAME_MAP = {
 }
 
 
-def fetch_outright_odds(api_key: str, sport_key: str = "soccer_fifa_world_cup",
-                        regions: str = "eu,uk") -> dict[str, float]:
+def fetch_outright_odds(api_key: str, regions: str = "eu,uk") -> dict[str, float]:
     """
-    Haal de outright winner-markt op (titelkansen per team) via de Odds API.
-    Retourneert {dataset_teamnaam: genormaliseerde_implied_probability}.
+    Haal de WK 2026 outright winner-kansen op via de Odds API.
 
-    De ruwe implied kansen (1/decimale_odds) worden genormaliseerd om de
-    bookmaker-overround te verwijderen, zodat ze optellen tot 1.0.
+    Strategie:
+      1. Vraag /v4/sports/?all=true op (geen credits) om alle beschikbare
+         sport-sleutels te vinden die lijken op een WK-winnaarsmarkt.
+      2. Haal van elke kandidaat-sleutel de odds op (h2h of outrights).
+      3. Normaliseer de implied kansen over alle bookmakers.
     """
     import requests
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
-    params = {"apiKey": api_key, "regions": regions,
-              "markets": "outrights", "oddsFormat": "decimal"}
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-
-    # verzamel implied kansen per team over alle bookmakers
     from collections import defaultdict
+
+    base = "https://api.the-odds-api.com/v4"
+
+    # stap 1: vind de juiste sport-sleutel (gratis, kost geen credits)
+    sports_resp = requests.get(f"{base}/sports/",
+                               params={"apiKey": api_key, "all": "true"}, timeout=30)
+    sports_resp.raise_for_status()
+    all_sports = sports_resp.json()
+
+    # zoek sport-sleutels die betrekking hebben op WK 2026 winnaar
+    candidates = [s["key"] for s in all_sports
+                  if any(k in s["key"].lower() for k in
+                         ["world_cup_winner", "world_cup_2026", "fifa_world_cup_winner"])
+                  or ("world_cup" in s.get("title", "").lower() and
+                      "winner" in s.get("title", "").lower())]
+
+    # als er geen gerichte treffer is: val terug op de gewone soccer_fifa_world_cup
+    # en probeer markets=outrights — sommige sleutels ondersteunen het toch
+    if not candidates:
+        candidates = ["soccer_fifa_world_cup"]
+
     raw: dict[str, list[float]] = defaultdict(list)
-    for event in data:
-        for bm in event.get("bookmakers", []):
-            for market in bm.get("markets", []):
-                if market.get("key") == "outrights":
-                    for outcome in market.get("outcomes", []):
-                        name = outcome.get("name", "")
-                        price = outcome.get("price", 0)
-                        if price > 1:
-                            raw[name].append(1.0 / price)
+    last_error = None
+    for sport_key in candidates:
+        for market in ("h2h", "outrights"):
+            try:
+                resp = requests.get(f"{base}/sports/{sport_key}/odds/",
+                                    params={"apiKey": api_key, "regions": regions,
+                                            "markets": market, "oddsFormat": "decimal"},
+                                    timeout=30)
+                if resp.status_code == 422:
+                    continue        # markttype niet ondersteund, probeer de andere
+                resp.raise_for_status()
+                data = resp.json()
+                for event in data:
+                    for bm in event.get("bookmakers", []):
+                        for mkt in bm.get("markets", []):
+                            for outcome in mkt.get("outcomes", []):
+                                name = outcome.get("name", "")
+                                price = outcome.get("price", 0)
+                                if price > 1 and name not in ("Field", "The Field"):
+                                    raw[name].append(1.0 / price)
+                if raw:
+                    break   # gegevens gevonden, stop met zoeken
+            except Exception as e:
+                last_error = e
+        if raw:
+            break
 
     if not raw:
-        return {}
+        raise ValueError(f"Geen outright-kansen gevonden. Laatste fout: {last_error}. "
+                         f"Beschikbare WK-sleutels: {candidates}")
 
-    # gemiddelde per team (over bookmakers)
+    # gemiddelde over bookmakers + overround verwijderen
     avg = {t: sum(p) / len(p) for t, p in raw.items()}
-
-    # normaliseer: verwijder de overround
     total = sum(avg.values())
     normalized = {t: p / total for t, p in avg.items()}
 
