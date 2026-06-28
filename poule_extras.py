@@ -340,57 +340,60 @@ def recommend_goal_leaders(goals):
     }
 
 
-def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules):
-    """
-    Voor elke BEKENDE knock-outwedstrijd (round == 'knockout' in odds_db) de
-    optimale score-voorspelling die de verwachte poulepunten maximaliseert.
-
-    Houdt rekening met:
-      - de odds-blend (model + bookmaker-1X2, via weight_odds)
-      - de verlenging: 90-min-gelijkspelen verschuiven naar de stand NA verlenging
-        (zoals de poule telt), via de gekalibreerde ET_GOAL_FACTOR.
-    """
+def _knockout_after_et_matrix(home, away, odds_db, ratings, cal, weight_odds):
+    """Bouw de score-kansmatrix NA verlenging voor één knock-outwedstrijd:
+    90-min-matrix → odds-blend → 90-min-gelijkspelen herverdeeld over de
+    stand na verlenging (gekalibreerde ET_GOAL_FACTOR)."""
     from math import exp, factorial
-    import numpy as np
     from model import (score_matrix, rescale_matrix_to_outcome, outcome_probs,
                        expected_goals as _eg)
     from odds_fetcher import get_odds_probs, blend as odds_blend
     from simulate import ET_GOAL_FACTOR
-    from poule_strategy import optimal_prediction, top_n_predictions
 
     def _pois(k, lam):
         return exp(-lam) * lam ** k / factorial(k)
+
+    lam_h, lam_a = _eg(ratings.get(home, 1500), ratings.get(away, 1500), cal)
+    M = score_matrix(lam_h, lam_a, cal)
+    op = get_odds_probs(odds_db, home, away)
+    if op is not None:
+        target = op if weight_odds >= 1.0 else odds_blend(outcome_probs(M), op, weight_odds)
+        M = rescale_matrix_to_outcome(M, *target)
+
+    n = M.shape[0]
+    et_h = ET_GOAL_FACTOR * lam_h / 3.0
+    et_a = ET_GOAL_FACTOR * lam_a / 3.0
+    M_adj = M.copy()
+    for k in range(n):
+        pk = M[k, k]
+        if pk <= 0:
+            continue
+        M_adj[k, k] = 0.0
+        for di in range(0, n - k):
+            ph = _pois(di, et_h)
+            for dj in range(0, n - k):
+                M_adj[k + di, k + dj] += pk * ph * _pois(dj, et_a)
+    s = M_adj.sum()
+    if s > 0:
+        M_adj /= s
+    return M_adj
+
+
+def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules):
+    """
+    Voor elke BEKENDE knock-outwedstrijd (round == 'knockout' in odds_db) de
+    optimale score-voorspelling die de verwachte poulepunten maximaliseert.
+    Houdt rekening met de odds-blend en de verlenging-correctie.
+    """
+    from model import outcome_probs
+    from poule_strategy import optimal_prediction, top_n_predictions
 
     out = []
     for key, info in odds_db.items():
         if info.get("round") != "knockout":
             continue
         h, a = info["home"], info["away"]
-        lam_h, lam_a = _eg(ratings.get(h, 1500), ratings.get(a, 1500), cal)
-        M = score_matrix(lam_h, lam_a, cal)               # 90 minuten
-        op = get_odds_probs(odds_db, h, a)
-        if op is not None:
-            target = op if weight_odds >= 1.0 else odds_blend(outcome_probs(M), op, weight_odds)
-            M = rescale_matrix_to_outcome(M, *target)
-
-        # verlenging: 90-min-gelijkspelen (diagonaal) herverdelen naar stand na ET
-        n = M.shape[0]
-        et_h = ET_GOAL_FACTOR * lam_h / 3.0
-        et_a = ET_GOAL_FACTOR * lam_a / 3.0
-        M_adj = M.copy()
-        for k in range(n):
-            pk = M[k, k]
-            if pk <= 0:
-                continue
-            M_adj[k, k] = 0.0
-            for di in range(0, n - k):
-                ph = _pois(di, et_h)
-                for dj in range(0, n - k):
-                    M_adj[k + di, k + dj] += pk * ph * _pois(dj, et_a)
-        s = M_adj.sum()
-        if s > 0:
-            M_adj /= s
-
+        M_adj = _knockout_after_et_matrix(h, a, odds_db, ratings, cal, weight_odds)
         gh, ga, ev = optimal_prediction(M_adj, rules)
         probs = outcome_probs(M_adj)
         alts = top_n_predictions(M_adj, rules, n=3)
@@ -402,6 +405,81 @@ def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules):
             "bookmaker": info.get("bookmaker", ""),
             "commence_time": info.get("commence_time", ""),
         })
-    # sorteer op aftraptijd zodat de eerstvolgende wedstrijden bovenaan staan
     out.sort(key=lambda r: r["commence_time"])
     return out
+
+
+def knockout_round_stats(odds_db, ratings, cal, weight_odds, card_rates=None,
+                         n_sims=20000, seed=11):
+    """
+    Doelpunten (voor/tegen) en kaarten per team voor de BEKENDE knock-outronde,
+    op basis van de werkelijke matchups uit odds_db. Monte-Carlo over de
+    na-verlenging-scoreverdeling per wedstrijd.
+
+    Returns dict met round-label, aantal wedstrijden en per team:
+      exp_gf, exp_ga, p_most_gf, p_most_ga (+ kaartvelden als card_rates gegeven).
+    """
+    import numpy as np
+    from collections import defaultdict
+
+    matches = [(v["home"], v["away"]) for v in odds_db.values()
+               if v.get("round") == "knockout"]
+    if not matches:
+        return None
+
+    # precompute per-match cumulatieve verdeling om uit te samplen
+    dists = []
+    for h, a in matches:
+        M = _knockout_after_et_matrix(h, a, odds_db, ratings, cal, weight_odds)
+        flat = M.flatten()
+        flat = flat / flat.sum()
+        dists.append((h, a, flat, M.shape[1]))
+
+    rng = np.random.default_rng(seed)
+    teams = sorted({t for m in matches for t in m})
+    gf = defaultdict(float); ga = defaultdict(float)
+    most_gf = defaultdict(float); most_ga = defaultdict(float)
+    cpts = defaultdict(float); most_c = defaultdict(float); fewest = defaultdict(float)
+
+    for _ in range(n_sims):
+        sim_gf, sim_ga, sim_c = {}, {}, {}
+        for h, a, flat, ncol in dists:
+            idx = rng.choice(len(flat), p=flat)
+            gh, ag = divmod(int(idx), ncol)
+            sim_gf[h], sim_ga[h] = gh, ag
+            sim_gf[a], sim_ga[a] = ag, gh
+            gf[h] += gh; ga[h] += ag; gf[a] += ag; ga[a] += gh
+            if card_rates:
+                for team in (h, a):
+                    cr = card_rates.get(team)
+                    if cr:
+                        yc = int(rng.poisson(cr["yellow_per_match"]))
+                        rc = int(rng.poisson(cr["red_per_match"]))
+                        sim_c[team] = yc + 2 * rc
+                        cpts[team] += yc + 2 * rc
+                        fewest[team] += (5 if yc == 0 and rc == 0 else
+                                         3 if yc == 1 and rc == 0 else
+                                         1 if (yc == 2 and rc == 0) or (rc == 1 and yc == 0) else 0)
+        for d, acc in [(sim_gf, most_gf), (sim_ga, most_ga)]:
+            mx = max(d.values())
+            lds = [t for t, v in d.items() if v == mx]
+            for t in lds:
+                acc[t] += 1 / len(lds)
+        if card_rates and sim_c:
+            mx = max(sim_c.values())
+            lds = [t for t, v in sim_c.items() if v == mx]
+            for t in lds:
+                most_c[t] += 1 / len(lds)
+
+    res = {}
+    for t in teams:
+        res[t] = {"exp_gf": gf[t] / n_sims, "exp_ga": ga[t] / n_sims,
+                  "p_most_gf": most_gf[t] / n_sims, "p_most_ga": most_ga[t] / n_sims}
+        if card_rates:
+            res[t].update({"exp_cpts": cpts[t] / n_sims,
+                           "p_most_cards": most_c[t] / n_sims,
+                           "exp_fewest_pts": fewest[t] / n_sims})
+    label = {16: "Laatste 32", 8: "Achtste finale", 4: "Kwartfinale",
+             2: "Halve finale", 1: "Finale"}.get(len(matches), f"{len(matches)} duels")
+    return {"round": label, "n_matches": len(matches), "teams": res,
+            "has_cards": bool(card_rates)}

@@ -497,6 +497,49 @@ with tab4:
         st.caption(f"{len(preds)} knock-outwedstrijd(en) · odds-blend "
                    f"{int(weight_odds*100)}% · 'Gelijk %' is de kans op een gelijke stand "
                    f"ná verlenging (penalty's). Verschuift de slider in de zijbalk, herlaad de pagina.")
+
+        # Doelpunten & kaarten voor de huidige ronde — werkelijke teams
+        from poule_extras import knockout_round_stats
+        rstats = knockout_round_stats(st.session_state["odds_db"], ratings, cal,
+                                      weight_odds,
+                                      card_rates=st.session_state.get("card_rates") or None)
+        if rstats:
+            st.markdown(f"#### Doelpunten & kaarten — {rstats['round']} (werkelijke teams)")
+            T = rstats["teams"]
+
+            def _ko_top(key, n=6):
+                return sorted(T.items(), key=lambda kv: -kv[1].get(key, 0))[:n]
+
+            g1, g2 = st.columns(2)
+            with g1:
+                st.markdown("**⚽ Meeste goals voor**")
+                st.dataframe(pd.DataFrame([
+                    {"Team": t, "P(meeste)": f"{d['p_most_gf']*100:.0f}%",
+                     "Verw. goals": round(d["exp_gf"], 1)} for t, d in _ko_top("p_most_gf")]),
+                    hide_index=True, use_container_width=True)
+            with g2:
+                st.markdown("**🥅 Meeste tegengoals**")
+                st.dataframe(pd.DataFrame([
+                    {"Team": t, "P(meeste)": f"{d['p_most_ga']*100:.0f}%",
+                     "Verw. tegen": round(d["exp_ga"], 1)} for t, d in _ko_top("p_most_ga")]),
+                    hide_index=True, use_container_width=True)
+            if rstats["has_cards"]:
+                k1, k2 = st.columns(2)
+                with k1:
+                    st.markdown("**🟨 Meeste kaarten** (1 geel, 2 rood)")
+                    st.dataframe(pd.DataFrame([
+                        {"Team": t, "P(meeste)": f"{d['p_most_cards']*100:.0f}%",
+                         "Verw. kaartpunten": round(d["exp_cpts"], 1)}
+                        for t, d in _ko_top("p_most_cards")]),
+                        hide_index=True, use_container_width=True)
+                with k2:
+                    st.markdown("**✅ Minste kaarten** (5/3/1 pt)")
+                    st.dataframe(pd.DataFrame([
+                        {"Team": t, "Verw. punten": round(d["exp_fewest_pts"], 2)}
+                        for t, d in _ko_top("exp_fewest_pts")]),
+                        hide_index=True, use_container_width=True)
+            else:
+                st.caption("Kaartrubrieken verschijnen na 'Haal kaartdata op' in de zijbalk.")
         st.divider()
 
     st.subheader("📊 Poule-advies groepsfase (Monte-Carlo)")
@@ -628,64 +671,3 @@ with tab4:
                 st.dataframe(pd.DataFrame(few_rows), use_container_width=True, hide_index=True)
             st.caption("Kaarten zijn ruisig en scheidsrechter-afhankelijk — behandel dit "
                        "als ruwe indicatie, niet als sterke voorspelling.")
-
-        # 6. Doelpunten & kaarten per knockout-ronde
-        st.subheader("6 · Doelpunten & kaarten per knock-outronde")
-        round_stats = sim.get("round_stats", {})
-        if not round_stats:
-            st.info("Geen per-ronde statistieken beschikbaar. Genereer het advies opnieuw.")
-        else:
-            has_cards_rnd = any("exp_cpts" in list(v.values())[0]
-                                for v in round_stats.values() if v)
-            rnd_labels = {"R32": "Laatste 32", "R16": "Achtste finale",
-                          "QF": "Kwartfinale", "SF": "Halve finale", "F": "Finale"}
-            for rn, rn_label in rnd_labels.items():
-                if rn not in round_stats:
-                    continue
-                rs = round_stats[rn]
-                with st.expander(f"{rn_label}", expanded=(rn == "R16")):
-                    top_n = 5
-                    # sorteren: onvoorwaardelijke kansen (incl. kans om die ronde te halen)
-                    def top(key, n=top_n):
-                        return sorted(rs.items(), key=lambda kv: -kv[1].get(key, 0))[:n]
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**⚽ Meeste goals voor**")
-                        rows = [{"Team": t,
-                                 "P(meeste goals)": f"{d['p_most_gf']*100:.0f}%",
-                                 "Verw. goals": round(d['exp_gf'], 1),
-                                 "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
-                                for t, d in top("p_most_gf")]
-                        st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                     use_container_width=True)
-                    with col2:
-                        st.markdown("**🥅 Meeste tegengoals**")
-                        rows = [{"Team": t,
-                                 "P(meeste tegendoelpunten)": f"{d['p_most_ga']*100:.0f}%",
-                                 "Verw. tegen": round(d['exp_ga'], 1),
-                                 "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
-                                for t, d in top("p_most_ga")]
-                        st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                     use_container_width=True)
-                    if has_cards_rnd and "exp_cpts" in list(rs.values())[0]:
-                        col3, col4 = st.columns(2)
-                        with col3:
-                            st.markdown("**🟨 Meeste kaarten** (1 pt geel, 2 pt rood)")
-                            rows = [{"Team": t,
-                                     "P(meeste kaarten)": f"{d['p_most_cards']*100:.0f}%",
-                                     "Verw. kaartpunten": round(d['exp_cpts'], 1),
-                                     "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
-                                    for t, d in top("p_most_cards")]
-                            st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                         use_container_width=True)
-                        with col4:
-                            st.markdown("**✅ Minste kaarten** (5/3/1 pt)")
-                            rows = [{"Team": t,
-                                     "Verw. punten": round(d['exp_fewest_pts'], 2),
-                                     "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
-                                    for t, d in top("exp_fewest_pts")]
-                            st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                         use_container_width=True)
-                    elif not has_cards_rnd:
-                        st.caption("Kaartadvies beschikbaar na 'Haal kaartdata op' (API-Football).")
