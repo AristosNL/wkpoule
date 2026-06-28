@@ -130,30 +130,57 @@ def _sample_from_dist(rng, pmf_data):
     return divmod(int(idx), n)
 
 
+# Verlenging-doelpuntenfactor: ET-lambda = ET_GOAL_FACTOR * (lambda_90 / 3).
+# Gekalibreerd op EK2020 (0,875 ET-goals/wedstrijd) + ~50% penalty-rate bij
+# gelijkwaardige teams. f≈1,2 omdat de verlenging op het competitiegemiddelde
+# tempo scoort, niet op het verlaagde tempo van deze defensieve tied-na-90 teams.
+ET_GOAL_FACTOR = 1.2
+
+
+def _play_extra_time(rng, gh, ga, lam_h, lam_a, et_factor: float = ET_GOAL_FACTOR):
+    """Speel 30 min verlenging. ET-tempo = et_factor * (90-min-lambda / 3).
+    Geef nieuwe stand terug. Penalty's wijzigen de score NIET (apart afgehandeld)."""
+    eh = rng.poisson(et_factor * lam_h / 3.0)
+    ea = rng.poisson(et_factor * lam_a / 3.0)
+    return gh + int(eh), ga + int(ea)
+
+
+def _knockout_resolve(rng, gh, ga, lam_h, lam_a, home, away):
+    """Bepaal de knock-out-uitslag volgens WK-regels: bij gelijkspel verlenging,
+    en als het dan nóg gelijk is een penalty-reeks (muntworp gewogen naar sterkte).
+    De TERUGGEGEVEN score is de stand NA verlenging (telt voor de poule)."""
+    if gh != ga:
+        return (home if gh > ga else away, gh, ga)
+    # 90 min gelijk -> verlenging
+    gh, ga = _play_extra_time(rng, gh, ga, lam_h, lam_a)
+    if gh != ga:
+        return (home if gh > ga else away, gh, ga)
+    # nog gelijk na 120 min -> penalty's bepalen alleen de winnaar, niet de score
+    ph = lam_h / (lam_h + lam_a)
+    winner = home if rng.random() < ph else away
+    return (winner, gh, ga)
+
+
 def _simulate_match(rng, ratings, cal, home, away, knockout=False,
                     city: str | None = None, fixture_dist=None):
     """
     Simuleer 1 wedstrijd. Met fixture_dist sample je uit de (mogelijk geblende)
     precomputed matrix; zonder val je terug op de pure Poisson uit het model.
-    Bij knock-out: geen gelijkspel (verlenging/penalty's).
+    Bij knock-out: bij gelijkspel verlenging + evt. penalty's. De teruggegeven
+    score is de stand NA verlenging (vóór penalty's) — zoals de poule telt.
     """
+    rh = _adjusted_rating(home, ratings.get(home, 1500), city)
+    ra = _adjusted_rating(away, ratings.get(away, 1500), city)
+    lam_h, lam_a = expected_goals(rh, ra, cal, neutral=True)
+
     if fixture_dist is not None:
         gh, ga = _sample_from_dist(rng, fixture_dist)
-        # voor de muntworp bij knock-out hebben we toch de lambdas nodig — fallback
-        if knockout and gh == ga:
-            rh = _adjusted_rating(home, ratings.get(home, 1500), city)
-            ra = _adjusted_rating(away, ratings.get(away, 1500), city)
-            lam_h, lam_a = expected_goals(rh, ra, cal, neutral=True)
-            ph = lam_h / (lam_h + lam_a)
-            return (home, gh, ga) if rng.random() < ph else (away, gh, ga)
     else:
-        rh = _adjusted_rating(home, ratings.get(home, 1500), city)
-        ra = _adjusted_rating(away, ratings.get(away, 1500), city)
-        lam_h, lam_a = expected_goals(rh, ra, cal, neutral=True)
         gh, ga = _sample_score(rng, lam_h, lam_a)
-        if knockout and gh == ga:
-            ph = lam_h / (lam_h + lam_a)
-            return (home, gh, ga) if rng.random() < ph else (away, gh, ga)
+
+    if knockout:
+        return _knockout_resolve(rng, gh, ga, lam_h, lam_a, home, away)
+
     winner = home if gh > ga else (away if ga > gh else None)
     return (winner, gh, ga)
 

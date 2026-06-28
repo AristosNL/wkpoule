@@ -22,12 +22,22 @@ from pathlib import Path
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 SPORT_KEY = "soccer_fifa_world_cup"
 
+# Alternatieve sport-sleutels die de Odds API soms gebruikt voor knockout-ronden.
+# De API probeert eerst de primaire sleutel; als die geen knockout-wedstrijden geeft,
+# worden deze ook geprobeerd.
+KNOCKOUT_SPORT_KEYS = [
+    "soccer_fifa_world_cup",
+    "soccer_world_cup_2026",
+    "soccer_fifa_world_cup_2026",
+]
+
+# Groepsfase-datumgrens: wedstrijden na deze datum zijn knockout-rondes.
+# WK 2026: groepsfase eindigt 26 juni; knockout start 28 juni.
+KNOCKOUT_START_DATE = "2026-06-27"
+
 # Voorkeursvolgorde voor bookmakers: scherpste eerst.
-# Pinnacle = lage marge, hoge limieten -> meest informatieve odds.
 PREFERRED_BOOKMAKERS = ["pinnacle", "bet365", "betfair", "williamhill", "unibet"]
 
-# Sommige teamnamen verschillen tussen The Odds API en onze Kaggle-dataset.
-# Vul deze tabel aan als je verschillen tegenkomt (linkerkant = Odds API, rechts = onze data).
 TEAM_NAME_MAP = {
     "USA": "United States",
     "South Korea": "South Korea",
@@ -90,34 +100,73 @@ def _extract_h2h(event: dict) -> dict | None:
     return None
 
 
-def fetch_odds(api_key: str, regions: str = "eu,uk") -> dict:
-    """
-    Haalt alle WK-wedstrijd-odds op. Retourneert een dict:
-        { "Home_Team|Away_Team": {p_home, p_draw, p_away, bookmaker, date}, ... }
-    """
-    url = f"{ODDS_API_BASE}/sports/{SPORT_KEY}/odds"
-    params = {"apiKey": api_key, "regions": regions, "markets": "h2h", "oddsFormat": "decimal"}
+def _fetch_events_for_sport(api_key: str, sport_key: str, regions: str) -> list:
+    """Haal alle events op voor één sport-sleutel. Levert [] terug bij 404/422."""
+    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
+    params = {"apiKey": api_key, "regions": regions, "markets": "h2h",
+              "oddsFormat": "decimal"}
     resp = requests.get(url, params=params, timeout=30)
+    if resp.status_code in (404, 422):
+        return []
     if resp.status_code == 401:
         raise RuntimeError("API-key afgewezen — controleer je sleutel.")
     resp.raise_for_status()
-    events = resp.json()
+    return resp.json()
 
+
+def fetch_odds(api_key: str, regions: str = "eu,uk") -> dict:
+    """
+    Haalt alle WK-wedstrijd-odds op (groepsfase én knockout).
+
+    Retourneert:
+        { "Home|Away": {p_home, p_draw, p_away, bookmaker, commence_time, round}, ... }
+
+    'round' is 'group' voor groepswedstrijden en 'knockout' voor knock-out-duels,
+    bepaald op basis van KNOCKOUT_START_DATE.
+
+    Strategie: probeer KNOCKOUT_SPORT_KEYS achtereenvolgens. Verifieer voor elke sleutel
+    of er knockout-wedstrijden in zitten; stop zodra we een volledige set hebben.
+    """
     odds_db: dict = {}
-    for event in events:
-        h = _normalize_team(event["home_team"])
-        a = _normalize_team(event["away_team"])
-        h2h = _extract_h2h(event)
-        if h2h is None:
+    tried_keys = set()
+
+    for sport_key in KNOCKOUT_SPORT_KEYS:
+        if sport_key in tried_keys:
             continue
-        p_home, p_draw, p_away = _decimal_odds_to_probs(h2h["home_odd"], h2h["draw_odd"], h2h["away_odd"])
-        odds_db[f"{h}|{a}"] = {
-            "home": h, "away": a,
-            "p_home": round(p_home, 4), "p_draw": round(p_draw, 4), "p_away": round(p_away, 4),
-            "bookmaker": h2h["bookmaker"],
-            "commence_time": event.get("commence_time"),
-        }
+        tried_keys.add(sport_key)
+        events = _fetch_events_for_sport(api_key, sport_key, regions)
+        for event in events:
+            h = _normalize_team(event["home_team"])
+            a = _normalize_team(event["away_team"])
+            h2h = _extract_h2h(event)
+            if h2h is None:
+                continue
+            p_home, p_draw, p_away = _decimal_odds_to_probs(
+                h2h["home_odd"], h2h["draw_odd"], h2h["away_odd"])
+            ct = event.get("commence_time", "")
+            rnd = "knockout" if ct >= KNOCKOUT_START_DATE else "group"
+            key = f"{h}|{a}"
+            if key not in odds_db:   # eerste (scherpste) bookmaker wint
+                odds_db[key] = {
+                    "home": h, "away": a,
+                    "p_home": round(p_home, 4),
+                    "p_draw": round(p_draw, 4),
+                    "p_away": round(p_away, 4),
+                    "bookmaker": h2h["bookmaker"],
+                    "commence_time": ct,
+                    "round": rnd,
+                }
+        # als we knockout-wedstrijden hebben gevonden, zijn we klaar
+        if any(v["round"] == "knockout" for v in odds_db.values()):
+            break
     return odds_db
+
+
+def split_odds_by_round(odds_db: dict) -> tuple[dict, dict]:
+    """Splits odds_db in (groep_odds, knockout_odds) op basis van het 'round'-veld."""
+    group = {k: v for k, v in odds_db.items() if v.get("round", "group") == "group"}
+    knockout = {k: v for k, v in odds_db.items() if v.get("round") == "knockout"}
+    return group, knockout
 
 
 def save_cache(odds_db: dict, path: str = "odds_cache.json") -> None:

@@ -128,7 +128,7 @@ def resolve_and_play(winners, runners, thirds_by_group, qualifying_third_groups,
         round_winners = []
         for h, a in current:
             w, gh, ga = simulate_match(h, a, knockout=True)
-            match_results.append((h, a, w))
+            match_results.append((h, a, w, gh, ga))
             round_winners.append(w)
         bracket.append({"round": round_names[si] if si < len(round_names) else "?",
                         "matches": match_results})

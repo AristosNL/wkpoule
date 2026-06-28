@@ -32,13 +32,13 @@ STAGE_COUNTS = {"last32": 32, "last16": 16, "quarter": 8,
 
 
 def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
-                  odds_db=None, weight_odds=0.0, outright_probs=None):
+                  odds_db=None, weight_odds=0.0, outright_probs=None,
+                  card_rates=None):
     """Eén simulatieloop die alle benodigde statistieken in één keer verzamelt.
 
     Groepsfase: geblende Poisson-matrix (odds_db + weight_odds).
-    Knock-out  : Bradley-Terry op basis van outright_probs (bookmakers) als die
-                 beschikbaar zijn; anders puur Elo. Fallback per team: als slechts
-                 één van de twee teams outright-odds heeft, wordt Elo gebruikt.
+    Knock-out  : per-wedstrijd odds → Bradley-Terry (met Elo-scoreschatting)
+                 → puur Elo. card_rates optioneel voor kaarten per ronde.
     """
     from simulate import precompute_fixture_distributions
     rng = np.random.default_rng(seed)
@@ -53,6 +53,16 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
     most_ga = defaultdict(float)                      # hoe vaak meeste goals tegen
     # bracket-tracking: per (ronde, match_idx, side) -> {team: count}
     bracket_pos = defaultdict(lambda: defaultdict(int))
+    # per-ronde goal/kaart-tracking (onvoorwaardelijke kansen: delen door n_sims)
+    rnd_gf    = defaultdict(float)   # (rn, team) -> sum goals voor
+    rnd_ga    = defaultdict(float)   # (rn, team) -> sum goals tegen
+    rnd_n     = defaultdict(int)     # (rn, team) -> aantaldeelnames
+    rnd_most_gf  = defaultdict(float)
+    rnd_most_ga  = defaultdict(float)
+    rnd_cpts     = defaultdict(float) if card_rates else None
+    rnd_fewest   = defaultdict(float) if card_rates else None
+    rnd_most_c   = defaultdict(float) if card_rates else None
+    rng_c = np.random.default_rng(seed + 31337) if card_rates else None
 
     # eenmalige precompute van de 72 groeps-distributies
     fixture_dists = precompute_fixture_distributions(ratings, cal, matches,
@@ -60,15 +70,65 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
                                                      weight_odds=weight_odds)
 
     def sim_match(home, away, knockout=False, city=None):
-        """Match-functie: voor knock-out Bradley-Terry op outrights (Elo-fallback)."""
-        if knockout and outright_probs:
-            pa = outright_probs.get(home)
-            pb = outright_probs.get(away)
-            if pa is not None and pb is not None and (pa + pb) > 0:
-                p_home = pa / (pa + pb)
-                winner = home if rng.random() < p_home else away
-                return (winner, 0, 0)   # goals onbekend in KO-only modus
-        # fallback: puur Elo (groepswedstrijden of ontbrekende outright-odds)
+        """Prioriteitsketen voor knockout:
+           1. Per-wedstrijd odds in odds_db (bv. Nederland-Marokko)
+           2. Bradley-Terry op outright_probs (bookmaker titelkansen)
+           3. Puur Elo
+        """
+        if knockout:
+            # --- prioriteit 1: per-wedstrijd odds ---
+            if odds_db:
+                from odds_fetcher import get_odds_probs
+                from model import (score_matrix, rescale_matrix_to_outcome,
+                                   outcome_probs, expected_goals as _eg)
+                from odds_fetcher import blend as odds_blend
+                op = get_odds_probs(odds_db, home, away)
+                if op is not None:
+                    lam_h, lam_a = _eg(
+                        ratings.get(home, 1500), ratings.get(away, 1500), cal)
+                    m = score_matrix(lam_h, lam_a, cal)
+                    if weight_odds < 1.0:
+                        model_p = outcome_probs(m)
+                        target = odds_blend(model_p, op, weight_odds)
+                    else:
+                        target = op
+                    m = rescale_matrix_to_outcome(m, *target)
+                    flat = m.flatten(); flat = flat / flat.sum()
+                    idx = rng.choice(len(flat), p=flat)
+                    gh, ga = divmod(int(idx), m.shape[1])
+                    if gh == ga:
+                        # verlenging (30 min): extra goals uit het Elo-model
+                        from simulate import _play_extra_time
+                        gh, ga = _play_extra_time(rng, gh, ga, lam_h, lam_a)
+                        if gh == ga:
+                            # penalty's: winnaar uit de odds, score blijft gelijk
+                            p_hw = target[0] / (target[0] + target[2])
+                            winner = home if rng.random() < p_hw else away
+                        else:
+                            winner = home if gh > ga else away
+                    else:
+                        winner = home if gh > ga else away
+                    return (winner, gh, ga)
+            # --- prioriteit 2: Bradley-Terry op outright-kansen ---
+            if outright_probs:
+                pa = outright_probs.get(home)
+                pb = outright_probs.get(away)
+                if pa is not None and pb is not None and (pa + pb) > 0:
+                    from model import expected_goals as _eg
+                    from simulate import _play_extra_time
+                    lam_h, lam_a = _eg(ratings.get(home, 1500),
+                                       ratings.get(away, 1500), cal)
+                    gh, ga = int(rng.poisson(lam_h)), int(rng.poisson(lam_a))
+                    if gh == ga:                      # verlenging
+                        gh, ga = _play_extra_time(rng, gh, ga, lam_h, lam_a)
+                    bt_winner = home if rng.random() < pa / (pa + pb) else away
+                    if gh == ga:
+                        # gelijk na verlenging -> penalty's (BT bepaalt), score blijft gelijk
+                        return (bt_winner, gh, ga)
+                    # beslissende stand -> hogere score naar de BT-winnaar
+                    hi, lo = max(gh, ga), min(gh, ga)
+                    return (home, hi, lo) if bt_winner == home else (away, lo, hi)
+        # --- prioriteit 3 / groepswedstrijden: puur Elo ---
         return _simulate_match(rng, ratings, cal, home, away,
                                knockout=knockout, city=city)
 
@@ -116,13 +176,53 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
         if reached["winner"] is not None:
             reach[reached["winner"]]["winner"] += 1
 
-        # bracket per ronde aggregeren: home/away per match + de winnaar
+        # bracket per ronde aggregeren
         for round_data in reached.get("bracket", []):
             rn = round_data["round"]
-            for mi, (h, a, w) in enumerate(round_data["matches"]):
+            sim_gf_rn: dict = {}
+            sim_ga_rn: dict = {}
+            sim_c_rn:  dict = {} if card_rates else None
+
+            for mi, entry in enumerate(round_data["matches"]):
+                h, a, w, gh, ga = entry
                 bracket_pos[(rn, mi, "home")][h] += 1
                 bracket_pos[(rn, mi, "away")][a] += 1
                 bracket_pos[(rn, mi, "winner")][w] += 1
+                # goals
+                for team, gf_v, ga_v in [(h, gh, ga), (a, ga, gh)]:
+                    sim_gf_rn[team] = sim_gf_rn.get(team, 0) + gf_v
+                    sim_ga_rn[team] = sim_ga_rn.get(team, 0) + ga_v
+                    rnd_n[(rn, team)] += 1
+                    rnd_gf[(rn, team)] += gf_v
+                    rnd_ga[(rn, team)] += ga_v
+                # kaarten
+                if card_rates:
+                    for team in (h, a):
+                        cr = card_rates.get(team)
+                        if cr:
+                            yc = int(rng_c.poisson(cr["yellow_per_match"]))
+                            rc = int(rng_c.poisson(cr["red_per_match"]))
+                            pts = yc + 2 * rc
+                            sim_c_rn[team] = sim_c_rn.get(team, 0) + pts
+                            rnd_cpts[(rn, team)] += pts
+                            # fewest scoring
+                            fp = (5 if yc == 0 and rc == 0 else
+                                  3 if yc == 1 and rc == 0 else
+                                  1 if (yc == 2 and rc == 0) or (rc == 1 and yc == 0) else 0)
+                            rnd_fewest[(rn, team)] += fp
+            # koplopers goals
+            for d, acc in [(sim_gf_rn, rnd_most_gf), (sim_ga_rn, rnd_most_ga)]:
+                if d:
+                    mx = max(d.values())
+                    lds = [t for t, v in d.items() if v == mx]
+                    for t in lds:
+                        acc[(rn, t)] += 1 / len(lds)
+            # koplopers kaarten
+            if card_rates and sim_c_rn:
+                mx = max(sim_c_rn.values())
+                lds = [t for t, v in sim_c_rn.items() if v == mx]
+                for t in lds:
+                    rnd_most_c[(rn, t)] += 1 / len(lds)
 
     # aggregeren
     stage_probs = []
@@ -160,8 +260,33 @@ def simulate_full(ratings, cal, groups, matches, n_sims=20000, seed=42,
                                   "p_home": p_h, "p_away": p_a, "p_winner": p_w})
         modal_bracket.append({"round": rn, "matches": round_matches})
 
+    # ---- round_stats: per ronde top-teams per categorie ----
+    round_stats: dict = {}
+    for rn in ["R32", "R16", "QF", "SF", "F"]:
+        teams_rn = {t for (r, t) in rnd_n if r == rn}
+        if not teams_rn:
+            continue
+        rs: dict = {}
+        for t in teams_rn:
+            n = rnd_n.get((rn, t), 0)
+            if not n:
+                continue
+            entry: dict = {
+                "p_appears":  n / n_sims,
+                "exp_gf":     rnd_gf.get((rn, t), 0) / n_sims,
+                "exp_ga":     rnd_ga.get((rn, t), 0) / n_sims,
+                "p_most_gf":  rnd_most_gf.get((rn, t), 0) / n_sims,
+                "p_most_ga":  rnd_most_ga.get((rn, t), 0) / n_sims,
+            }
+            if card_rates:
+                entry["exp_cpts"]       = rnd_cpts.get((rn, t), 0) / n_sims
+                entry["p_most_cards"]   = rnd_most_c.get((rn, t), 0) / n_sims
+                entry["exp_fewest_pts"] = rnd_fewest.get((rn, t), 0) / n_sims
+            rs[t] = entry
+        round_stats[rn] = rs
+
     return {"stage_probs": stage_probs, "position_probs": dict(position_probs),
-            "goals": goals, "bracket": modal_bracket}
+            "goals": goals, "bracket": modal_bracket, "round_stats": round_stats}
 
 
 # ----------------------------------------------------------------------------

@@ -23,30 +23,54 @@ from elo import expected_score, HOME_ADVANTAGE
 class Calibration:
     """Parameters die we uit de historie schatten."""
     goals_per_elo: float   # 'a': verwacht doelsaldo per Elo-punt verschil
-    base_total: float      # gemiddeld aantal doelpunten per interland
+    base_total: float      # gemiddeld aantal doelpunten per interland (gemiddelde)
     rho: float = -0.08     # Dixon-Coles lage-score-correctie (0 = uit)
+    total_intercept: float = 0.0   # c0: verwacht totaal bij gelijke teams
+    total_slope: float = 0.0       # c1: extra goals per |Elo-punt| mismatch
 
 
 def calibrate(history: list[dict], since_year: int = 2010) -> Calibration:
     """
-    Schat 'a' (doelsaldo per Elo-punt) en het gemiddelde totaal uit de historie.
-    Lineaire regressie door de oorsprong: supremacy = a * dr.
+    Schat de modelparameters uit de historie:
+      - 'a' (doelsaldo per Elo-punt): regressie door de oorsprong, supremacy = a*dr
+      - totaal goals als functie van de mismatch: totaal = c0 + c1*|dr|
+        (in plaats van een vast gemiddelde — mismatches leveren méér goals op,
+         zie Reep e.a. 1971 / over-dispersie bij niveauverschil)
     """
-    dr = np.array([h["dr"] for h in history if h["date"].year >= since_year])
-    sup = np.array([h["supremacy"] for h in history if h["date"].year >= since_year])
-    tot = np.array([h["total_goals"] for h in history if h["date"].year >= since_year])
+    import numpy as np
+    H = [h for h in history if h["date"].year >= since_year]
+    dr = np.array([h["dr"] for h in H])
+    sup = np.array([h["supremacy"] for h in H])
+    tot = np.array([h["total_goals"] for h in H])
+
     a = float(np.sum(dr * sup) / np.sum(dr * dr))
-    return Calibration(goals_per_elo=a, base_total=float(tot.mean()))
+
+    # totaal goals ~ c0 + c1*|dr|  (kleinste kwadraten)
+    absdr = np.abs(dr)
+    A = np.vstack([np.ones_like(absdr), absdr]).T
+    (c0, c1), *_ = np.linalg.lstsq(A, tot, rcond=None)
+
+    return Calibration(goals_per_elo=a, base_total=float(tot.mean()),
+                       total_intercept=float(c0), total_slope=float(c1))
 
 
 def expected_goals(rating_home: float, rating_away: float, cal: Calibration,
                    neutral: bool = True) -> tuple[float, float]:
-    """Verwachte goals (lambda) voor beide teams op basis van Elo."""
+    """Verwachte goals (lambda) voor beide teams op basis van Elo.
+
+    Het verwachte TOTAAL schaalt mee met de mismatch (total_intercept + slope*|dr|);
+    bij oudere Calibration-objecten zonder die velden valt het terug op base_total.
+    """
     home_adv = 0.0 if neutral else HOME_ADVANTAGE
     dr = (rating_home + home_adv) - rating_away
     supremacy = cal.goals_per_elo * dr
-    lam_home = max(0.15, (cal.base_total + supremacy) / 2.0)
-    lam_away = max(0.15, (cal.base_total - supremacy) / 2.0)
+    if cal.total_intercept > 0:
+        total = cal.total_intercept + cal.total_slope * abs(dr)
+    else:
+        total = cal.base_total
+    total = min(4.8, max(1.5, total))      # grenzen tegen rare extrapolaties
+    lam_home = max(0.15, (total + supremacy) / 2.0)
+    lam_away = max(0.15, (total - supremacy) / 2.0)
     return lam_home, lam_away
 
 

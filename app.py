@@ -25,7 +25,7 @@ from elo import compute_elo
 from model import calibrate, predict_match
 from simulate import derive_groups, simulate_tournament
 from odds_fetcher import (load_cache, cache_info, fetch_odds, save_cache,
-                          fetch_outright_odds)
+                          fetch_outright_odds, split_odds_by_round)
 from poule_strategy import ScoringRules, optimal_prediction, expected_points
 from poule_extras import (simulate_full, recommend_group_standing,
                           recommend_qualifiers, recommend_goal_leaders,
@@ -86,7 +86,8 @@ def run_simulation(ratings, cal, wc_records, n_sims, odds_db, weight_odds):
                     + f", knock-out: {ko_label}) ..."):
         sim = simulate_full(ratings, cal, groups, matches, n_sims=n_sims,
                             odds_db=odds_db or None, weight_odds=weight_odds,
-                            outright_probs=out_probs)
+                            outright_probs=out_probs,
+                            card_rates=st.session_state.get("card_rates") or None)
     st.session_state["sim_result"] = sim
     st.session_state["sim_meta"] = {
         "n_sims": n_sims,
@@ -135,8 +136,9 @@ def expected_points_heatmap(matrix, rules, home, away, n=6):
     return fig
 
 
-def render_bracket_html(bracket_data: list) -> str:
-    """Bouw een HTML-bracket uit de modale teams per slot. 5 kolommen + winnaar."""
+def render_bracket_html(bracket_data: list, odds_known: set | None = None) -> str:
+    """Bouw een HTML-bracket. odds_known = set van "HomeTeam|AwayTeam" (of omgekeerd)
+    waarvoor echte wedstrijdodds beschikbaar zijn — die krijgen een ster-markering."""
     short = {
         "Bosnia and Herzegovina": "Bosnia & H.", "Czech Republic": "Czech R.",
         "South Korea": "S. Korea", "United States": "USA", "DR Congo": "DR Congo",
@@ -146,9 +148,12 @@ def render_bracket_html(bracket_data: list) -> str:
     sh = lambda t: short.get(t, t)
     titles = {"R32": "Laatste 32", "R16": "Achtste finale", "QF": "Kwartfinale",
               "SF": "Halve finale", "F": "Finale"}
+    odds_known = odds_known or set()
+
+    def has_odds(home, away):
+        return (f"{home}|{away}" in odds_known or f"{away}|{home}" in odds_known)
 
     def cell(name, prob, is_winner):
-        # gedempt tonen als de positie onzeker is (<25%)
         muted = "" if prob >= 0.25 else "opacity:0.65;font-style:italic;"
         cls = "team winner" if is_winner else "team"
         return (f'<div class="{cls}" style="{muted}">'
@@ -164,8 +169,10 @@ def render_bracket_html(bracket_data: list) -> str:
             w = m["winner"]
             home_winner = (m["home"] == w)
             away_winner = (m["away"] == w)
+            odds_badge = (' <span class="odds-badge" title="Echte wedstrijdodds '
+                          'beschikbaar">★</span>') if has_odds(m["home"], m["away"]) else ""
             items.append(
-                '<div class="match">'
+                f'<div class="match">{odds_badge}'
                 + cell(m["home"], m["p_home"], home_winner)
                 + cell(m["away"], m["p_away"], away_winner)
                 + '</div>')
@@ -173,7 +180,6 @@ def render_bracket_html(bracket_data: list) -> str:
         if rn == "F" and r["matches"]:
             champion = r["matches"][0]
 
-    # extra kolom voor de wereldkampioen
     if champion:
         w_html = (
             '<div class="round">'
@@ -190,10 +196,11 @@ def render_bracket_html(bracket_data: list) -> str:
       .bracket { display: flex; gap: 6px; padding: 6px; min-height: 1100px; font-size: 11px; }
       .round { flex: 1; display: flex; flex-direction: column; justify-content: space-around; min-width: 0; }
       .round-title { background: #185FA5; color: white; padding: 5px 6px; text-align: center;
-                     font-weight: 600; border-radius: 4px; margin-bottom: 4px; font-size: 11px;
-                     letter-spacing: 0.02em; }
+                     font-weight: 600; border-radius: 4px; margin-bottom: 4px; font-size: 11px; }
       .match { background: #F8F8F6; border: 1px solid #E0E0D8; border-radius: 4px;
-               padding: 3px 4px; margin: 2px 0; }
+               padding: 3px 4px; margin: 2px 0; position: relative; }
+      .odds-badge { position: absolute; top: 2px; right: 4px; color: #E8A020;
+                    font-size: 9px; line-height: 1; }
       .team { display: flex; justify-content: space-between; align-items: center;
               padding: 2px 4px; gap: 6px; }
       .team.winner { background: #D0E5FA; font-weight: 600; border-radius: 3px; color: #042C53; }
@@ -240,8 +247,14 @@ if "odds_db" not in st.session_state:
 
 st.sidebar.subheader("Bookmaker-odds")
 _odds_loaded = len(st.session_state["odds_db"])
-st.sidebar.caption(f"{_odds_loaded} wedstrijden in cache" if _odds_loaded
-                   else "(nog geen odds opgehaald)")
+if _odds_loaded:
+    _grp, _ko = split_odds_by_round(st.session_state["odds_db"])
+    _caption = f"{len(_grp)} groepswedstrijden"
+    if _ko:
+        _caption += f" + **{len(_ko)} knock-out** in cache"
+    st.sidebar.caption(_caption)
+else:
+    st.sidebar.caption("(nog geen odds opgehaald)")
 
 api_key = get_secret("ODDS_API_KEY")
 if not api_key:
@@ -587,15 +600,80 @@ with tab4:
             st.caption("Kaarten zijn ruisig en scheidsrechter-afhankelijk — behandel dit "
                        "als ruwe indicatie, niet als sterke voorspelling.")
 
-        # 5. Knock-out bracket volgens FIFA-schema
-        st.subheader("5 · Knock-out bracket (volgens FIFA-schema, ingevuld door simulatie)")
+        # 5. Knock-out bracket
+        st.subheader("5 · Knock-out bracket (FIFA-schema, ingevuld door simulatie)")
         if "bracket" not in sim:
-            st.error("De bracket-data ontbreekt in het simulatieresultaat. "
-                     "Meestal komt dit doordat `poule_extras.py`, `simulate.py` of "
-                     "`knockout.py` nog de oude versie is. Controleer dat alle vier "
-                     "bestanden (app.py + die drie) in je GitHub-repo geüpdatet zijn, "
-                     "en herstart de app via 'Manage app' → ⋮ → Reboot.")
+            st.error("Bracket-data ontbreekt — controleer of knockout.py en poule_extras.py "
+                     "de nieuwste versie zijn en herstart via 'Manage app' → Reboot.")
         else:
-            st.caption("Per slot het meest voorkomende team uit de simulatie. Het percentage "
-                       "geeft aan hoe vaak dat team daar terechtkomt — lage % = onzekere positie.")
-            components.html(render_bracket_html(sim["bracket"]), height=1180, scrolling=True)
+            _, ko_odds = split_odds_by_round(st.session_state["odds_db"])
+            odds_known = set(ko_odds.keys())
+            if odds_known:
+                st.caption(f"★ = odds beschikbaar voor {len(odds_known)} knock-outwedstrijd(en) "
+                           f"— gesimuleerd met echte wedstrijdkansen. Overige duels: Bradley-Terry / Elo.")
+            else:
+                st.caption("Per slot het meest voorkomende team. Percentage = hoe vaak dat team "
+                           "daar terechtkomt. Knock-out: Bradley-Terry op outright-odds / Elo-fallback.")
+            components.html(render_bracket_html(sim["bracket"], odds_known=odds_known),
+                            height=1180, scrolling=True)
+
+        # 6. Doelpunten & kaarten per knockout-ronde
+        st.subheader("6 · Doelpunten & kaarten per knock-outronde")
+        round_stats = sim.get("round_stats", {})
+        if not round_stats:
+            st.info("Geen per-ronde statistieken beschikbaar. Genereer het advies opnieuw.")
+        else:
+            has_cards_rnd = any("exp_cpts" in list(v.values())[0]
+                                for v in round_stats.values() if v)
+            rnd_labels = {"R32": "Laatste 32", "R16": "Achtste finale",
+                          "QF": "Kwartfinale", "SF": "Halve finale", "F": "Finale"}
+            for rn, rn_label in rnd_labels.items():
+                if rn not in round_stats:
+                    continue
+                rs = round_stats[rn]
+                with st.expander(f"{rn_label}", expanded=(rn == "R16")):
+                    top_n = 5
+                    # sorteren: onvoorwaardelijke kansen (incl. kans om die ronde te halen)
+                    def top(key, n=top_n):
+                        return sorted(rs.items(), key=lambda kv: -kv[1].get(key, 0))[:n]
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**⚽ Meeste goals voor**")
+                        rows = [{"Team": t,
+                                 "P(meeste goals)": f"{d['p_most_gf']*100:.0f}%",
+                                 "Verw. goals": round(d['exp_gf'], 1),
+                                 "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
+                                for t, d in top("p_most_gf")]
+                        st.dataframe(pd.DataFrame(rows), hide_index=True,
+                                     use_container_width=True)
+                    with col2:
+                        st.markdown("**🥅 Meeste tegengoals**")
+                        rows = [{"Team": t,
+                                 "P(meeste tegendoelpunten)": f"{d['p_most_ga']*100:.0f}%",
+                                 "Verw. tegen": round(d['exp_ga'], 1),
+                                 "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
+                                for t, d in top("p_most_ga")]
+                        st.dataframe(pd.DataFrame(rows), hide_index=True,
+                                     use_container_width=True)
+                    if has_cards_rnd and "exp_cpts" in list(rs.values())[0]:
+                        col3, col4 = st.columns(2)
+                        with col3:
+                            st.markdown("**🟨 Meeste kaarten** (1 pt geel, 2 pt rood)")
+                            rows = [{"Team": t,
+                                     "P(meeste kaarten)": f"{d['p_most_cards']*100:.0f}%",
+                                     "Verw. kaartpunten": round(d['exp_cpts'], 1),
+                                     "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
+                                    for t, d in top("p_most_cards")]
+                            st.dataframe(pd.DataFrame(rows), hide_index=True,
+                                         use_container_width=True)
+                        with col4:
+                            st.markdown("**✅ Minste kaarten** (5/3/1 pt)")
+                            rows = [{"Team": t,
+                                     "Verw. punten": round(d['exp_fewest_pts'], 2),
+                                     "P(in ronde)": f"{d['p_appears']*100:.0f}%"}
+                                    for t, d in top("exp_fewest_pts")]
+                            st.dataframe(pd.DataFrame(rows), hide_index=True,
+                                         use_container_width=True)
+                    elif not has_cards_rnd:
+                        st.caption("Kaartadvies beschikbaar na 'Haal kaartdata op' (API-Football).")
