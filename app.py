@@ -470,9 +470,38 @@ with tab3:
 
 # ---- Tab 4: volledig poule-advies ----
 with tab4:
-    st.write("Optimaal advies voor de extra rubrieken, op basis van de "
-             "Monte-Carlo-simulatie (officieel R32-schema). De groepswedstrijden "
-             "gebruiken de odds-blend uit de zijbalk; knock-out blijft puur model.")
+    # === Knock-out wedstrijd-voorspellingen (werkt direct vanuit de odds) ===
+    _grp_o, _ko_o = split_odds_by_round(st.session_state["odds_db"])
+    if _ko_o:
+        st.subheader("🎯 Knock-out wedstrijden — beste score-voorspelling")
+        st.write("Voor elke bekende knock-outwedstrijd de uitslag die de meeste "
+                 "**poulepunten** oplevert (4 winnaar / 6 doelsaldo / 10 exact). "
+                 "Gebruikt de odds-blend uit de zijbalk én de verlenging-correctie: "
+                 "de getoonde stand is die ná verlenging, vóór penalty's — zoals de poule telt.")
+        from poule_extras import knockout_match_predictions
+        ko_rules = ScoringRules(exact=10, goal_diff=6, winner=4, cumulative=False)
+        preds = knockout_match_predictions(st.session_state["odds_db"], ratings, cal,
+                                           weight_odds, ko_rules)
+        rows = []
+        for p in preds:
+            rows.append({
+                "Wedstrijd": f"{p['home']} – {p['away']}",
+                "Beste voorspelling": f"{p['pred_h']}-{p['pred_a']}",
+                "Verw. punten": p["ev"],
+                "Win %": round(p["p_home"] * 100),
+                "Gelijk %": round(p["p_draw"] * 100),
+                "Verlies %": round(p["p_away"] * 100),
+                "Alternatieven": ", ".join(f"{x}-{y} ({e})" for x, y, e in p["alts"][1:]),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption(f"{len(preds)} knock-outwedstrijd(en) · odds-blend "
+                   f"{int(weight_odds*100)}% · 'Gelijk %' is de kans op een gelijke stand "
+                   f"ná verlenging (penalty's). Verschuift de slider in de zijbalk, herlaad de pagina.")
+        st.divider()
+
+    st.subheader("📊 Poule-advies groepsfase (Monte-Carlo)")
+    st.write("Advies voor de groepsfase-rubrieken. De groepswedstrijden gebruiken de "
+             "odds-blend uit de zijbalk.")
     n_sims4 = st.select_slider("Aantal simulaties ", options=[5000, 10000, 20000, 50000],
                                value=20000, key="nsims_advies")
     if st.button("▶️ Genereer poule-advies"):
@@ -599,23 +628,6 @@ with tab4:
                 st.dataframe(pd.DataFrame(few_rows), use_container_width=True, hide_index=True)
             st.caption("Kaarten zijn ruisig en scheidsrechter-afhankelijk — behandel dit "
                        "als ruwe indicatie, niet als sterke voorspelling.")
-
-        # 5. Knock-out bracket
-        st.subheader("5 · Knock-out bracket (FIFA-schema, ingevuld door simulatie)")
-        if "bracket" not in sim:
-            st.error("Bracket-data ontbreekt — controleer of knockout.py en poule_extras.py "
-                     "de nieuwste versie zijn en herstart via 'Manage app' → Reboot.")
-        else:
-            _, ko_odds = split_odds_by_round(st.session_state["odds_db"])
-            odds_known = set(ko_odds.keys())
-            if odds_known:
-                st.caption(f"★ = odds beschikbaar voor {len(odds_known)} knock-outwedstrijd(en) "
-                           f"— gesimuleerd met echte wedstrijdkansen. Overige duels: Bradley-Terry / Elo.")
-            else:
-                st.caption("Per slot het meest voorkomende team. Percentage = hoe vaak dat team "
-                           "daar terechtkomt. Knock-out: Bradley-Terry op outright-odds / Elo-fallback.")
-            components.html(render_bracket_html(sim["bracket"], odds_known=odds_known),
-                            height=1180, scrolling=True)
 
         # 6. Doelpunten & kaarten per knockout-ronde
         st.subheader("6 · Doelpunten & kaarten per knock-outronde")

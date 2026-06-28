@@ -338,3 +338,70 @@ def recommend_goal_leaders(goals):
         "meeste_goals_tegen": {"team": most_ga[0], "kans": most_ga[1]["p_most_ga"],
                                "verwacht_aantal": most_ga[1]["ga"]},
     }
+
+
+def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules):
+    """
+    Voor elke BEKENDE knock-outwedstrijd (round == 'knockout' in odds_db) de
+    optimale score-voorspelling die de verwachte poulepunten maximaliseert.
+
+    Houdt rekening met:
+      - de odds-blend (model + bookmaker-1X2, via weight_odds)
+      - de verlenging: 90-min-gelijkspelen verschuiven naar de stand NA verlenging
+        (zoals de poule telt), via de gekalibreerde ET_GOAL_FACTOR.
+    """
+    from math import exp, factorial
+    import numpy as np
+    from model import (score_matrix, rescale_matrix_to_outcome, outcome_probs,
+                       expected_goals as _eg)
+    from odds_fetcher import get_odds_probs, blend as odds_blend
+    from simulate import ET_GOAL_FACTOR
+    from poule_strategy import optimal_prediction, top_n_predictions
+
+    def _pois(k, lam):
+        return exp(-lam) * lam ** k / factorial(k)
+
+    out = []
+    for key, info in odds_db.items():
+        if info.get("round") != "knockout":
+            continue
+        h, a = info["home"], info["away"]
+        lam_h, lam_a = _eg(ratings.get(h, 1500), ratings.get(a, 1500), cal)
+        M = score_matrix(lam_h, lam_a, cal)               # 90 minuten
+        op = get_odds_probs(odds_db, h, a)
+        if op is not None:
+            target = op if weight_odds >= 1.0 else odds_blend(outcome_probs(M), op, weight_odds)
+            M = rescale_matrix_to_outcome(M, *target)
+
+        # verlenging: 90-min-gelijkspelen (diagonaal) herverdelen naar stand na ET
+        n = M.shape[0]
+        et_h = ET_GOAL_FACTOR * lam_h / 3.0
+        et_a = ET_GOAL_FACTOR * lam_a / 3.0
+        M_adj = M.copy()
+        for k in range(n):
+            pk = M[k, k]
+            if pk <= 0:
+                continue
+            M_adj[k, k] = 0.0
+            for di in range(0, n - k):
+                ph = _pois(di, et_h)
+                for dj in range(0, n - k):
+                    M_adj[k + di, k + dj] += pk * ph * _pois(dj, et_a)
+        s = M_adj.sum()
+        if s > 0:
+            M_adj /= s
+
+        gh, ga, ev = optimal_prediction(M_adj, rules)
+        probs = outcome_probs(M_adj)
+        alts = top_n_predictions(M_adj, rules, n=3)
+        out.append({
+            "home": h, "away": a,
+            "pred_h": gh, "pred_a": ga, "ev": round(ev, 2),
+            "p_home": probs[0], "p_draw": probs[1], "p_away": probs[2],
+            "alts": [(x, y, round(e, 2)) for x, y, e in alts],
+            "bookmaker": info.get("bookmaker", ""),
+            "commence_time": info.get("commence_time", ""),
+        })
+    # sorteer op aftraptijd zodat de eerstvolgende wedstrijden bovenaan staan
+    out.sort(key=lambda r: r["commence_time"])
+    return out
