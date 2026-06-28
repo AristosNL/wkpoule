@@ -482,6 +482,10 @@ with tab3:
 with tab4:
     # === Knock-out wedstrijd-voorspellingen (werkt direct vanuit de odds) ===
     _grp_o, _ko_o = split_odds_by_round(st.session_state["odds_db"])
+    if not st.session_state["odds_db"]:
+        st.info("📋 Klik op **🔄 Ververs odds** in de zijbalk om de knock-out "
+                "wedstrijdkansen op te halen. Daarna verschijnen hier automatisch "
+                "de score-voorspellingen en doelpunten-/kaartenrubrieken.")
     if _ko_o:
         st.subheader("🎯 Knock-out wedstrijden — beste score-voorspelling")
         st.write("Voor elke bekende knock-outwedstrijd de uitslag die de meeste "
