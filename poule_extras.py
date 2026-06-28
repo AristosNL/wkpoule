@@ -340,20 +340,28 @@ def recommend_goal_leaders(goals):
     }
 
 
-def _knockout_after_et_matrix(home, away, odds_db, ratings, cal, weight_odds):
+def _knockout_after_et_matrix(home, away, odds_db, ratings, cal, weight_odds,
+                              use_totals=True):
     """Bouw de score-kansmatrix NA verlenging voor één knock-outwedstrijd:
-    90-min-matrix → odds-blend → 90-min-gelijkspelen herverdeeld over de
-    stand na verlenging (gekalibreerde ET_GOAL_FACTOR)."""
+    90-min-matrix → (optioneel) totaal herschaald naar de over/under-markt →
+    odds-blend op 1X2 → 90-min-gelijkspelen herverdeeld over de stand na verlenging."""
     from math import exp, factorial
     from model import (score_matrix, rescale_matrix_to_outcome, outcome_probs,
                        expected_goals as _eg)
-    from odds_fetcher import get_odds_probs, blend as odds_blend
+    from odds_fetcher import get_odds_probs, blend as odds_blend, get_implied_total
     from simulate import ET_GOAL_FACTOR
 
     def _pois(k, lam):
         return exp(-lam) * lam ** k / factorial(k)
 
     lam_h, lam_a = _eg(ratings.get(home, 1500), ratings.get(away, 1500), cal)
+    # herschaal het verwachte totaal naar de over/under-markt (verhouding behouden)
+    if use_totals:
+        T = get_implied_total(odds_db, home, away)
+        if T is not None and (lam_h + lam_a) > 0:
+            f = T / (lam_h + lam_a)
+            lam_h, lam_a = lam_h * f, lam_a * f
+
     M = score_matrix(lam_h, lam_a, cal)
     op = get_odds_probs(odds_db, home, away)
     if op is not None:
@@ -379,7 +387,7 @@ def _knockout_after_et_matrix(home, away, odds_db, ratings, cal, weight_odds):
     return M_adj
 
 
-def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules):
+def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules, use_totals=True):
     """
     Voor elke BEKENDE knock-outwedstrijd (round == 'knockout' in odds_db) de
     optimale score-voorspelling die de verwachte poulepunten maximaliseert.
@@ -393,7 +401,7 @@ def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules):
         if info.get("round") != "knockout":
             continue
         h, a = info["home"], info["away"]
-        M_adj = _knockout_after_et_matrix(h, a, odds_db, ratings, cal, weight_odds)
+        M_adj = _knockout_after_et_matrix(h, a, odds_db, ratings, cal, weight_odds, use_totals)
         gh, ga, ev = optimal_prediction(M_adj, rules)
         probs = outcome_probs(M_adj)
         alts = top_n_predictions(M_adj, rules, n=3)
@@ -409,7 +417,7 @@ def knockout_match_predictions(odds_db, ratings, cal, weight_odds, rules):
     return out
 
 
-def knockout_round_stats(odds_db, ratings, cal, weight_odds, card_rates=None,
+def knockout_round_stats(odds_db, ratings, cal, weight_odds, card_rates=None, use_totals=True,
                          n_sims=20000, seed=11):
     """
     Doelpunten (voor/tegen) en kaarten per team voor de BEKENDE knock-outronde,
@@ -430,7 +438,7 @@ def knockout_round_stats(odds_db, ratings, cal, weight_odds, card_rates=None,
     # precompute per-match cumulatieve verdeling om uit te samplen
     dists = []
     for h, a in matches:
-        M = _knockout_after_et_matrix(h, a, odds_db, ratings, cal, weight_odds)
+        M = _knockout_after_et_matrix(h, a, odds_db, ratings, cal, weight_odds, use_totals)
         flat = M.flatten()
         flat = flat / flat.sum()
         dists.append((h, a, flat, M.shape[1]))

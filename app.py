@@ -307,6 +307,16 @@ weight_odds = st.sidebar.slider("Gewicht odds vs. model", 0.0, 1.0, 0.8, 0.05,
                                 help="0.8 = 80% odds, 20% model. Geldt alleen voor "
                                      "wedstrijden waarvoor odds beschikbaar zijn.")
 
+# tel hoeveel wedstrijden over/under-data hebben
+_n_totals = sum(1 for v in st.session_state.get("odds_db", {}).values()
+                if v.get("total_line") is not None)
+use_totals = st.sidebar.checkbox(
+    "Totaal-goals uit over/under-markt", value=True,
+    help="Kalibreert het verwachte totaal-doelpunten op de over/under-markt van de "
+         "bookmakers in plaats van op het historische model. Geldt voor de knock-out.")
+if _n_totals:
+    st.sidebar.caption(f"over/under beschikbaar voor {_n_totals} wedstrijd(en)")
+
 st.sidebar.subheader("Scoreregels poule")
 exact = st.sidebar.number_input("Punten exacte uitslag", value=10, min_value=0)
 goal_diff = st.sidebar.number_input("Punten doelsaldo", value=6, min_value=0)
@@ -481,7 +491,7 @@ with tab4:
         from poule_extras import knockout_match_predictions
         ko_rules = ScoringRules(exact=10, goal_diff=6, winner=4, cumulative=False)
         preds = knockout_match_predictions(st.session_state["odds_db"], ratings, cal,
-                                           weight_odds, ko_rules)
+                                           weight_odds, ko_rules, use_totals=use_totals)
         rows = []
         for p in preds:
             rows.append({
@@ -494,15 +504,18 @@ with tab4:
                 "Alternatieven": ", ".join(f"{x}-{y} ({e})" for x, y, e in p["alts"][1:]),
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        _tot_txt = (f"totaal-goals uit over/under-markt ({_n_totals} wedstrijden)"
+                    if use_totals and _n_totals else "totaal-goals uit historisch model")
         st.caption(f"{len(preds)} knock-outwedstrijd(en) · odds-blend "
-                   f"{int(weight_odds*100)}% · 'Gelijk %' is de kans op een gelijke stand "
-                   f"ná verlenging (penalty's). Verschuift de slider in de zijbalk, herlaad de pagina.")
+                   f"{int(weight_odds*100)}% · {_tot_txt} · 'Gelijk %' is de kans op een "
+                   f"gelijke stand ná verlenging (penalty's). Pas de zijbalk aan en herlaad.")
 
         # Doelpunten & kaarten voor de huidige ronde — werkelijke teams
         from poule_extras import knockout_round_stats
         rstats = knockout_round_stats(st.session_state["odds_db"], ratings, cal,
                                       weight_odds,
-                                      card_rates=st.session_state.get("card_rates") or None)
+                                      card_rates=st.session_state.get("card_rates") or None,
+                                      use_totals=use_totals)
         if rstats:
             st.markdown(f"#### Doelpunten & kaarten — {rstats['round']} (werkelijke teams)")
             T = rstats["teams"]

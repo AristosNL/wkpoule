@@ -58,7 +58,71 @@ def _normalize_team(name: str) -> str:
     return TEAM_NAME_MAP.get(name, name)
 
 
-def _decimal_odds_to_probs(home_odd: float, draw_odd: float, away_odd: float) -> tuple[float, float, float]:
+def _extract_totals(event: dict) -> dict | None:
+    """Vind de totals-markt (over/under) bij de eerste bruikbare bookmaker.
+    Kiest de hoofdlijn: de lijn waar P(over) het dichtst bij 50% ligt.
+    Retourneert {line, p_over, p_under} (marge-vrij) of None."""
+    order = PREFERRED_BOOKMAKERS + [b["key"] for b in event.get("bookmakers", [])]
+    seen = set()
+    for key in order:
+        if key in seen:
+            continue
+        seen.add(key)
+        bm = next((b for b in event.get("bookmakers", []) if b["key"] == key), None)
+        if bm is None:
+            continue
+        for market in bm.get("markets", []):
+            if market.get("key") != "totals":
+                continue
+            # groepeer Over/Under per lijn (point)
+            lines: dict = {}
+            for o in market.get("outcomes", []):
+                pt = o.get("point")
+                if pt is None:
+                    continue
+                lines.setdefault(pt, {})[o["name"].lower()] = o["price"]
+            best = None
+            for pt, v in lines.items():
+                if "over" not in v or "under" not in v:
+                    continue
+                po_raw, pu_raw = 1.0 / v["over"], 1.0 / v["under"]
+                s = po_raw + pu_raw
+                p_over, p_under = po_raw / s, pu_raw / s
+                dist = abs(p_over - 0.5)            # hoofdlijn = meest gebalanceerd
+                if best is None or dist < best[0]:
+                    best = (dist, pt, p_over, p_under)
+            if best:
+                _, pt, p_over, p_under = best
+                return {"line": pt, "p_over": round(p_over, 4),
+                        "p_under": round(p_under, 4)}
+    return None
+
+
+def implied_total_goals(line: float, p_under: float) -> float | None:
+    """Leid het verwachte totaal-doelpunten af uit P(under line).
+    Model: totaal ~ Poisson(lambda_T); los lambda_T op uit Poisson.cdf(floor(line)) = p_under."""
+    from math import floor
+    from scipy.stats import poisson
+    from scipy.optimize import brentq
+    k = floor(line)                                 # 'under 2.5' => totaal <= 2
+    if not (0.0 < p_under < 1.0):
+        return None
+    f = lambda lam: poisson.cdf(k, lam) - p_under   # dalend in lam
+    try:
+        return float(brentq(f, 0.05, 12.0))
+    except ValueError:
+        return None
+
+
+def get_implied_total(odds_db: dict, home: str, away: str) -> float | None:
+    """Verwacht totaal-doelpunten uit de over/under-markt voor deze wedstrijd, of None."""
+    info = odds_db.get(f"{home}|{away}") or odds_db.get(f"{away}|{home}")
+    if not info or info.get("total_line") is None or info.get("p_under") is None:
+        return None
+    return implied_total_goals(info["total_line"], info["p_under"])
+
+
+
     """Zet decimale odds om naar marge-vrije kansen (overround eruit halen)."""
     raw = [1.0 / home_odd, 1.0 / draw_odd, 1.0 / away_odd]
     s = sum(raw)
@@ -100,10 +164,76 @@ def _extract_h2h(event: dict) -> dict | None:
     return None
 
 
-def _fetch_events_for_sport(api_key: str, sport_key: str, regions: str) -> list:
+def _extract_totals(event: dict) -> dict | None:
+    """Vind de totals-markt (over/under) bij de eerste voorkeursbookmaker.
+    Retourneert {line, over_odd, under_odd, bookmaker} of None."""
+    def _from_market(market, bmkey):
+        if market.get("key") != "totals":
+            return None
+        over = under = line = None
+        for o in market.get("outcomes", []):
+            if o.get("name") == "Over":
+                over, line = o.get("price"), o.get("point")
+            elif o.get("name") == "Under":
+                under = o.get("price")
+        if over and under and line is not None:
+            return {"bookmaker": bmkey, "line": float(line),
+                    "over_odd": float(over), "under_odd": float(under)}
+        return None
+
+    bms = {b["key"]: b for b in event.get("bookmakers", [])}
+    for pref in PREFERRED_BOOKMAKERS:
+        if pref in bms:
+            for market in bms[pref].get("markets", []):
+                r = _from_market(market, pref)
+                if r:
+                    return r
+    for bm in event.get("bookmakers", []):
+        for market in bm.get("markets", []):
+            r = _from_market(market, bm["key"])
+            if r:
+                return r
+    return None
+
+
+def totals_to_expected_goals(line: float, over_odd: float, under_odd: float) -> float | None:
+    """Leid het verwachte totaal-goals af uit een over/under-markt.
+
+    De-vig de over/under-kansen, en zoek de Poisson-rate mu waarvoor
+    P(totaal >= ceil(line)) gelijk is aan de over-kans. Het totaal van twee
+    Poisson-teams is zelf Poisson(mu), dus dit geeft het marktverwachte totaal.
+    """
+    from math import exp, floor
+    raw_o, raw_u = 1.0 / over_odd, 1.0 / under_odd
+    p_over = raw_o / (raw_o + raw_u)            # marge eruit
+    thr = floor(line) + 1                        # bv. line 2.5 -> P(N >= 3)
+
+    def p_ge_thr(mu):
+        # 1 - P(N <= thr-1)
+        cdf = 0.0
+        term = exp(-mu)
+        for k in range(thr):
+            if k > 0:
+                term *= mu / k
+            cdf += term
+        return 1.0 - cdf
+
+    # bisectie op mu in [0.2, 8.0]; p_ge_thr is monotoon stijgend in mu
+    lo, hi = 0.2, 8.0
+    if p_over <= p_ge_thr(lo):
+        return lo
+    if p_over >= p_ge_thr(hi):
+        return hi
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if p_ge_thr(mid) < p_over:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2, 3)
     """Haal alle events op voor één sport-sleutel. Levert [] terug bij 404/422."""
     url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
-    params = {"apiKey": api_key, "regions": regions, "markets": "h2h",
+    params = {"apiKey": api_key, "regions": regions, "markets": "h2h,totals",
               "oddsFormat": "decimal"}
     resp = requests.get(url, params=params, timeout=30)
     if resp.status_code in (404, 422):
@@ -147,6 +277,7 @@ def fetch_odds(api_key: str, regions: str = "eu,uk") -> dict:
             rnd = "knockout" if ct >= KNOCKOUT_START_DATE else "group"
             key = f"{h}|{a}"
             if key not in odds_db:   # eerste (scherpste) bookmaker wint
+                tot = _extract_totals(event)
                 odds_db[key] = {
                     "home": h, "away": a,
                     "p_home": round(p_home, 4),
@@ -155,6 +286,9 @@ def fetch_odds(api_key: str, regions: str = "eu,uk") -> dict:
                     "bookmaker": h2h["bookmaker"],
                     "commence_time": ct,
                     "round": rnd,
+                    "total_line": tot["line"] if tot else None,
+                    "p_over": tot["p_over"] if tot else None,
+                    "p_under": tot["p_under"] if tot else None,
                 }
         # als we knockout-wedstrijden hebben gevonden, zijn we klaar
         if any(v["round"] == "knockout" for v in odds_db.values()):
